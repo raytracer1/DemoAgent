@@ -108,11 +108,14 @@ ${JSON.stringify(body.elements, null, 2)}
 Generate the execution plan as a JSON array.`;
 
   try {
+    // Fetch the job to get the goal
+    const job = await c.env.DB.prepare('SELECT goal FROM jobs WHERE id = ?').bind(id).first();
+    const goal = job?.goal || body.url;
     const resp = await llm.chat.completions.create({
       model,
       messages: [
         { role: 'system', content: prompt },
-        { role: 'user', content: `URL: ${body.url}\nGoal: 在 World Cup 2026 中创建视频（请使用页面上的实际元素）` },
+        { role: 'user', content: `URL: ${body.url}\nGoal: ${goal}\n\nGenerate the execution plan as a JSON array.` },
       ],
       temperature: 0.3,
       max_tokens: 2000,

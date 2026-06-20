@@ -402,24 +402,44 @@ async def process_job(job: dict):
             else:
                 audio_path = None
 
+            # ── Step 5.5: Generate SRT subtitles ──
+            srt_path = None
+            if narration.strip():
+                try:
+                    srt_path = str(temp_dir / "subtitles.srt")
+                    _generate_srt(narration, srt_path)
+                    print(f"   📝 Subtitles generated")
+                except Exception as e:
+                    print(f"   ⚠️  SRT error: {e}")
+
             # ── Step 6: Assemble video (ffmpeg) ──
             final_path = str(temp_dir / "final.mp4")
             if audio_path and Path(audio_path).exists():
-                print(f"   🎬 Assembling video with audio...")
-                cmd = [
-                    "ffmpeg", "-y",
+                print(f"   🎬 Assembling video with audio + subtitles...")
+                has_subs = srt_path and Path(srt_path).exists()
+                vf = f"subtitles={srt_path}:force_style='FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=1.5'" if has_subs else None
+                cmd = ["ffmpeg", "-y",
                     "-i", recording_path,
                     "-i", audio_path,
+                ]
+                if vf:
+                    cmd += ["-vf", vf]
+                cmd += [
                     "-c:v", "libx264", "-preset", "fast", "-crf", "23",
                     "-c:a", "aac", "-b:a", "128k",
                     "-shortest",
                     final_path,
                 ]
             else:
-                print(f"   🎬 Converting video (no audio)...")
-                cmd = [
-                    "ffmpeg", "-y",
+                print(f"   🎬 Converting video with subtitles (no audio)...")
+                has_subs = srt_path and Path(srt_path).exists()
+                vf = f"subtitles={srt_path}:force_style='FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=1.5'" if has_subs else None
+                cmd = ["ffmpeg", "-y",
                     "-i", recording_path,
+                ]
+                if vf:
+                    cmd += ["-vf", vf]
+                cmd += [
                     "-c:v", "libx264", "-preset", "fast", "-crf", "23",
                     "-an",
                     final_path,
@@ -434,8 +454,13 @@ async def process_job(job: dict):
             if proc.returncode != 0:
                 err = stderr.decode() if stderr else "unknown"
                 print(f"   ⚠️  ffmpeg error: {err[:200]}")
-                # Fallback: use raw recording
-                final_path = recording_path
+                # Fallback: simple convert without subtitles
+                print(f"   🔄 Retrying without subtitles...")
+                fallback = ["ffmpeg", "-y", "-i", recording_path, "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-an", final_path]
+                fp = await asyncio.create_subprocess_exec(*fallback, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                _, ferr = await fp.communicate()
+                if fp.returncode != 0:
+                    final_path = recording_path
 
             # ── Step 7: Upload to Worker/R2 ──
             print(f"   📤 Uploading video to R2...")
@@ -461,6 +486,34 @@ async def process_job(job: dict):
                 await browser.close()
             except Exception:
                 pass
+
+
+def _generate_srt(text: str, output_path: str, chunk_secs: int = 4):
+    """Generate an SRT subtitle file from narration text."""
+    words = text.split()
+    if not words:
+        return
+
+    # Split into chunks of ~10 words each
+    words_per_chunk = max(1, len(words) // max(1, (len(words) + 9) // 10))
+    chunks = []
+    for i in range(0, len(words), words_per_chunk):
+        chunk = " ".join(words[i:i + words_per_chunk])
+        if chunk:
+            chunks.append(chunk)
+
+    def _fmt(sec: int) -> str:
+        h, m = divmod(sec, 3600)
+        m, s = divmod(m, 60)
+        return f"{h:02d}:{m:02d}:{s:02d},000"
+
+    with open(output_path, "w") as f:
+        for i, chunk in enumerate(chunks):
+            start = i * chunk_secs
+            end = start + chunk_secs
+            f.write(f"{i + 1}\n")
+            f.write(f"{_fmt(start)} --> {_fmt(end)}\n")
+            f.write(f"{chunk}\n\n")
 
 
 # ── Main loop ───────────────────────────────────────────
