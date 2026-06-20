@@ -111,6 +111,7 @@ Return ONLY a JSON array. Each step: {"action": "click|type|select|wait|upload|s
 CRITICAL RULES:
 - target MUST be an element text actually listed in CURRENT PAGE ELEMENTS below (copy it exactly)
 - Do NOT use "navigate" — stay on the current site
+- Do NOT click "Sign in", "Login", or any auth-related buttons (user is already logged in)
 - Do NOT invent URLs or elements not in the list
 - If no relevant element exists, return []
 

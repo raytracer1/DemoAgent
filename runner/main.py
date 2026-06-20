@@ -198,13 +198,21 @@ async def execute_step(page, step: dict, index: int) -> dict:
 
     try:
         if action == "navigate":
-            await page.goto(value or target, wait_until="networkidle", timeout=timeout)
+            await page.goto(value or target, wait_until="domcontentloaded", timeout=timeout)
             await asyncio.sleep(1)
 
         elif action == "click":
             el = await find_element(page, target)
             if el:
+                pre_click_url = page.url
                 await el.click(timeout=timeout)
+                # Domain guard: go back if we navigated to external site
+                from urllib.parse import urlparse as _up
+                if _up(page.url).netloc and _up(pre_click_url).netloc:
+                    if _up(pre_click_url).netloc not in _up(page.url).netloc and _up(page.url).netloc not in _up(pre_click_url).netloc:
+                        await page.go_back(timeout=timeout)
+                        result["status"] = "skipped"
+                        result["error"] = f"blocked external: {page.url[:60]}"
             else:
                 result["status"] = "skipped"
                 result["error"] = f"not found: {target}"
@@ -268,84 +276,53 @@ async def process_job(job: dict):
     temp_dir = TMP_ROOT / job_id
     temp_dir.mkdir(parents=True, exist_ok=True)
 
+    # ── Phase 1: Discover plan (no recording) ──
     async with async_playwright() as p:
-        context_kwargs = {
-            "viewport": VIEWPORT,
-        }
-
-        # If session exists, load cookies
-        cookies_loaded = False
+        cookies = None
         if session_id:
             session_data = await api(f"/api/sessions/{session_id}")
             cookies_raw = session_data.get("cookies") if session_data else None
             if cookies_raw:
                 try:
-                    _ = json.loads(cookies_raw)  # validate JSON
-                    cookies_loaded = True
+                    cookies = json.loads(cookies_raw)
                 except Exception:
                     pass
 
-        # Record video
-        video_dir = str(temp_dir / "recording")
-        os.makedirs(video_dir, exist_ok=True)
-        context_kwargs["record_video_dir"] = video_dir
-        context_kwargs["record_video_size"] = VIEWPORT
-
         browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(**context_kwargs)
-
-        # Load cookies if available
-        if cookies_loaded:
-            cookies = json.loads(cookies_raw)
+        context = await browser.new_context(viewport=VIEWPORT)
+        if cookies:
             await context.add_cookies(cookies)
-            print(f"   🍪 Loaded login cookies")
-
         page = await context.new_page()
 
         try:
-            # ── Step 1: Extract elements + get initial plan ──
-            all_results = []  # all step results across all rounds
+            print(f"   📄 Navigating to {url}...")
+            await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+            await asyncio.sleep(2)
+
+            all_steps: list[dict] = []
             last_url = ""
-
-            if status == "extracting":
-                print(f"   📄 Navigating to {url}...")
-                await page.goto(url, wait_until="networkidle", timeout=15000)
-                await asyncio.sleep(2)
-
-            # ── Multi-round planning loop ──
             MAX_ROUNDS = 3
+
             for round_num in range(1, MAX_ROUNDS + 1):
                 current_url = page.url
-                print(f"\n   🔄 Round {round_num} — current page: {current_url}")
+                print(f"\n   🔄 Round {round_num} — {current_url}")
 
-                # Extract elements from current page
-                print(f"   🔍 Extracting page elements...")
                 elements = await extract_page_elements(page)
+                history = [{"step": s["index"], "action": s["action"], "target": s["target"]} for s in all_steps]
 
-                # Send to Worker: elements + history of executed steps
-                history = [{
-                    "step": r["index"],
-                    "action": r["action"],
-                    "target": r["target"],
-                    "status": r["status"],
-                } for r in all_results]
-
-                print(f"   📤 Sending to Worker for planning (round {round_num}, {len(history)} steps done)...")
+                print(f"   📤 Planning (round {round_num}, {len(history)} done)...")
                 await api(f"/api/jobs/{job_id}/elements", "PUT", json_data={
-                    "url": current_url,
-                    "elements": elements,
-                    "history": history,
-                    "round": round_num,
+                    "url": current_url, "elements": elements,
+                    "history": history, "round": round_num,
                 })
 
-                # Wait for Worker to generate plan
+                # Wait for plan
                 for _ in range(30):
                     await asyncio.sleep(2)
                     updated = await api(f"/api/jobs/{job_id}")
                     if updated.get("status") == "ready" and updated.get("plan"):
                         plan = updated["plan"]
-                        if isinstance(plan, str):
-                            plan = json.loads(plan)
+                        if isinstance(plan, str): plan = json.loads(plan)
                         break
                     if updated.get("status") == "error":
                         raise Exception(f"Plan failed: {updated.get('error')}")
@@ -353,186 +330,262 @@ async def process_job(job: dict):
                     raise Exception("Planning timed out")
 
                 if not plan or len(plan) <= len(history):
-                    print(f"   ✅ No more steps needed. Goal reached!")
+                    print(f"   ✅ Plan complete!")
                     break
 
-                # Only execute NEW steps (skip already-executed ones)
                 new_steps = plan[len(history):]
-                if not new_steps:
-                    print(f"   ✅ All steps executed. Goal reached!")
-                    break
+                if not new_steps: break
 
-                print(f"   📋 {len(new_steps)} new steps to execute")
-                await api(f"/api/jobs/{job_id}/status", "PUT", json_data={"status": "running"})
-
-                # Execute new steps
+                print(f"   📋 {len(new_steps)} new steps found")
                 page_changed = False
                 for step in new_steps:
-                    idx = len(all_results)
-                    step["index"] = idx
-                    print(f"      Step {idx+1}: {step.get('action')} → {step.get('target', '')[:60]}")
+                    step["index"] = len(all_steps)
+                    print(f"      {step['index']+1}: {step.get('action')} → {step.get('target', '')[:60]}")
                     pre_url = page.url
-                    result = await execute_step(page, step, idx)
-                    all_results.append(result)
+                    result = await execute_step(page, step, step["index"])
+                    all_steps.append(step)
 
-                    if result["status"] == "error":
-                        print(f"      ⚠️  {result.get('error', 'unknown')}")
-
-                    # Check if URL changed (navigation happened)
-                    post_url = page.url
-                    if post_url != pre_url and post_url != last_url:
-                        print(f"   🔀 Page changed: {pre_url[:50]} → {post_url[:50]}")
-                        last_url = post_url
+                    if page.url != pre_url and page.url != last_url:
+                        # Check if we left the target site
+                        from urllib.parse import urlparse
+                        target_domain = urlparse(url).netloc
+                        new_domain = urlparse(page.url).netloc
+                        if target_domain and new_domain and target_domain not in new_domain and new_domain not in target_domain:
+                            print(f"   🚫 External domain: {new_domain} — going back")
+                            all_steps.pop()  # remove the bad step
+                            await page.go_back()
+                            await asyncio.sleep(1)
+                            continue  # skip this step, keep planning
+                        print(f"   🔀 Page changed: {pre_url[:50]} → {page.url[:50]}")
+                        last_url = page.url
                         page_changed = True
-                        break  # break out of step loop, trigger re-planning
-
+                        break
                     await asyncio.sleep(0.5)
 
-                # If all steps done without page change AND plan fully executed → done
-                if not page_changed and len(all_results) >= len(plan):
+                if not page_changed and len(all_steps) >= len(plan):
                     break
-
-                # If page changed, we need another round — but re-check if plan still has more
                 if page_changed:
                     continue
 
-            print(f"\n   ✅ All rounds complete: {len(all_results)} steps executed")
-            print(f"   Results: {sum(1 for r in all_results if r['status']=='ok')}/{len(all_results)} OK")
-
-            # ── Step 3: Generate narration ──
-            await api(f"/api/jobs/{job_id}/status", "PUT", json_data={"status": "narrating"})
-            print(f"   🎤 Generating narration...")
-            narration_resp = await api(f"/api/jobs/{job_id}/narration", "POST")
-            narration = narration_resp.get("narration", "")
-            print(f"   📝 Narration: {narration[:80]}...")
-
-            # ── Step 4: Close browser (finalizes video) ──
             await context.close()
             await browser.close()
 
-            # Find the recorded video
+            if not all_steps:
+                raise Exception("No steps discovered")
+
+            print(f"\n   ✅ Plan discovered: {len(all_steps)} steps total")
+            for s in all_steps:
+                print(f"      {s['index']+1}: {s['action']} → {s['target'][:60]}")
+
+        except Exception as e:
+            await context.close()
+            await browser.close()
+            raise e
+
+    # ── Phase 2: Narration + TTS (before recording) ──
+    await api(f"/api/jobs/{job_id}/status", "PUT", json_data={"status": "narrating"})
+    print(f"   🎤 Generating narration...")
+    narration_resp = await api(f"/api/jobs/{job_id}/narration", "POST")
+    narration = narration_resp.get("narration", "")
+    print(f"   📝 Narration: {narration[:80]}...")
+
+    audio_path = str(temp_dir / "narration.mp3")
+    subs_path = str(temp_dir / "narration.vtt")
+    audio_duration = 30.0  # fallback
+    per_step_pauses: list[float] = []  # exact pause per step from subtitle timing
+
+    if narration.strip():
+        try:
+            print(f"   🔊 Generating TTS with word timestamps...")
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, "-m", "edge_tts",
+                "--voice", "en-US-AriaNeural",
+                "--text", narration,
+                "--write-media", audio_path,
+                "--write-subtitles", subs_path,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            await proc.wait()
+            if proc.returncode == 0:
+                adur_proc = await asyncio.create_subprocess_exec(
+                    "ffprobe", "-v", "error", "-show_entries", "format=duration",
+                    "-of", "default=noprint_wrappers=1:nokey=1", audio_path,
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                )
+                adur_out, _ = await adur_proc.communicate()
+                audio_duration = float(adur_out.decode().strip())
+                print(f"   ⏱️  TTS: {audio_duration:.1f}s")
+
+                # Parse VTT subtitles to get per-step timing
+                per_step_pauses = _parse_vtt_for_steps(subs_path, len(all_steps), audio_duration)
+                print(f"   🕐 Per-step timing: {[f'{p:.1f}s' for p in per_step_pauses]}")
+            else:
+                print(f"   ⚠️  TTS failed"); audio_path = None
+        except Exception as e:
+            print(f"   ⚠️  TTS error: {e}"); audio_path = None
+    else:
+        audio_path = None
+
+    # ── Phase 3: Execute with recording (paced by exact audio timing) ──
+    if not per_step_pauses:
+        per_step_pauses = [audio_duration / len(all_steps)] * len(all_steps) if all_steps else []
+    print(f"   🎬 Recording with per-step audio timing...")
+
+    video_dir = str(temp_dir / "recording")
+    os.makedirs(video_dir, exist_ok=True)
+
+    async with async_playwright() as p:
+        cookies = None
+        if session_id:
+            session_data = await api(f"/api/sessions/{session_id}")
+            cookies_raw = session_data.get("cookies") if session_data else None
+            if cookies_raw:
+                try: cookies = json.loads(cookies_raw)
+                except Exception: pass
+
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(
+            viewport=VIEWPORT,
+            record_video_dir=video_dir,
+            record_video_size=VIEWPORT,
+        )
+        if cookies:
+            await context.add_cookies(cookies)
+        page = await context.new_page()
+
+        try:
+            # Navigate to starting URL
+            await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+            await asyncio.sleep(1)
+
+            step_times: list[float] = []
+            recording_start = time.time()
+
+            for i, step in enumerate(all_steps):
+                step_times.append(time.time() - recording_start)
+                print(f"      Step {i+1}/{len(all_steps)}: {step.get('action')} → {step.get('target', '')[:60]}")
+                await execute_step(page, step, i)
+                # Pause for this step's narration segment duration
+                pause = per_step_pauses[i] if i < len(per_step_pauses) else per_step_pauses[-1]
+                pause *= 0.9  # slight overlap for natural flow
+                print(f"      ⏸  Holding for {pause:.1f}s (narration for this step)")
+                await asyncio.sleep(pause)
+
+            await context.close()
+            await browser.close()
+
+            # Find recording
             video_files = sorted(Path(video_dir).glob("*.webm"))
             if not video_files:
-                raise Exception("No video recording found")
+                raise Exception("No recording found")
             recording_path = str(video_files[-1])
             print(f"   🎥 Recording: {recording_path}")
 
-            # ── Step 5: TTS (edge-tts) ──
-            audio_path = str(temp_dir / "narration.mp3")
-            if narration.strip():
-                try:
-                    print(f"   🔊 Generating TTS...")
-                    proc = await asyncio.create_subprocess_exec(
-                        sys.executable, "-m", "edge_tts",
-                        "--voice", "en-US-AriaNeural",
-                        "--text", narration,
-                        "--write-media", audio_path,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                    )
-                    await proc.wait()
-                    if proc.returncode != 0:
-                        print(f"   ⚠️  TTS failed, using silent video")
-                        audio_path = None
-                except Exception as e:
-                    print(f"   ⚠️  TTS error: {e}")
-                    audio_path = None
-            else:
-                audio_path = None
-
-            # ── Step 5.5: Generate SRT subtitles ──
-            srt_path = None
-            if narration.strip():
-                try:
-                    srt_path = str(temp_dir / "subtitles.srt")
-                    _generate_srt(narration, srt_path)
-                    print(f"   📝 Subtitles generated")
-                except Exception as e:
-                    print(f"   ⚠️  SRT error: {e}")
-
-            # ── Step 6: Assemble video (ffmpeg) ──
-            final_path = str(temp_dir / "final.mp4")
-            if audio_path and Path(audio_path).exists():
-                print(f"   🎬 Assembling video with audio + subtitles...")
-                has_subs = srt_path and Path(srt_path).exists()
-                vf = f"subtitles={srt_path}:force_style='FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=1.5'" if has_subs else None
-                cmd = ["ffmpeg", "-y",
-                    "-i", recording_path,
-                    "-i", audio_path,
-                ]
-                if vf:
-                    cmd += ["-vf", vf]
-                cmd += [
-                    "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                    "-c:a", "aac", "-b:a", "128k",
-                    "-shortest",
-                    final_path,
-                ]
-            else:
-                print(f"   🎬 Converting video with subtitles (no audio)...")
-                has_subs = srt_path and Path(srt_path).exists()
-                vf = f"subtitles={srt_path}:force_style='FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=1.5'" if has_subs else None
-                cmd = ["ffmpeg", "-y",
-                    "-i", recording_path,
-                ]
-                if vf:
-                    cmd += ["-vf", vf]
-                cmd += [
-                    "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                    "-an",
-                    final_path,
-                ]
-
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _, stderr = await proc.communicate()
-            if proc.returncode != 0:
-                err = stderr.decode() if stderr else "unknown"
-                print(f"   ⚠️  ffmpeg error: {err[:200]}")
-                # Fallback: simple convert without subtitles
-                print(f"   🔄 Retrying without subtitles...")
-                fallback = ["ffmpeg", "-y", "-i", recording_path, "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-an", final_path]
-                fp = await asyncio.create_subprocess_exec(*fallback, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-                _, ferr = await fp.communicate()
-                if fp.returncode != 0:
-                    final_path = recording_path
-
-            # ── Step 7: Upload to Worker/R2 ──
-            print(f"   📤 Uploading video to R2...")
-            with open(final_path, "rb") as f:
-                await api(f"/api/jobs/{job_id}/video", "PUT", data=f.read())
-            print(f"   ✅ Upload complete!")
-
-            # ── Cleanup ──
-            import shutil
-            shutil.rmtree(temp_dir, ignore_errors=True)
-
-            print(f"   🎉 Job {job_id} complete!")
-            print(f"   📺 {WORKER_URL}/api/video/{job_id}")
-
         except Exception as e:
-            print(f"   ❌ Job failed: {e}")
-            await api(f"/api/jobs/{job_id}/status", "PUT", json_data={
-                "status": "error",
-                "error": str(e)[:500],
-            })
-            try:
-                await context.close()
-                await browser.close()
-            except Exception:
-                pass
+            await context.close()
+            await browser.close()
+            raise e
+
+    # ── Phase 4: SRT + Assembly ──
+    srt_path = None
+    if narration.strip():
+        try:
+            srt_path = str(temp_dir / "subtitles.srt")
+            _generate_srt(narration, srt_path, duration=audio_duration, step_times=step_times)
+            print(f"   📝 Subtitles (synced to {audio_duration:.1f}s TTS)")
+        except Exception as e:
+            print(f"   ⚠️  SRT error: {e}")
+
+    final_path = str(temp_dir / "final.mp4")
+    has_subs = srt_path and Path(srt_path).exists()
+    has_audio = audio_path and Path(audio_path).exists()
+
+    if has_audio:
+        print(f"   🎬 Assembling video + audio + subtitles...")
+        cmd = ["ffmpeg", "-y", "-i", recording_path, "-i", audio_path]
+        if has_subs:
+            cmd += ["-vf", f"subtitles={srt_path}:force_style='FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=1.5'"]
+        cmd += ["-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "aac", "-b:a", "128k", final_path]
+    else:
+        print(f"   🎬 Converting video + subtitles...")
+        cmd = ["ffmpeg", "-y", "-i", recording_path]
+        if has_subs:
+            cmd += ["-vf", f"subtitles={srt_path}:force_style='FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=1.5'"]
+        cmd += ["-c:v", "libx264", "-preset", "fast", "-crf", "23", "-an", final_path]
+
+    proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    _, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        err = stderr.decode() if stderr else "?"
+        print(f"   ⚠️  ffmpeg error: {err[:200]}")
+        final_path = recording_path  # fallback
+
+    # ── Upload ──
+    print(f"   📤 Uploading to R2...")
+    with open(final_path, "rb") as f:
+        await api(f"/api/jobs/{job_id}/video", "PUT", data=f.read())
+
+    import shutil
+    shutil.rmtree(temp_dir, ignore_errors=True)
+    print(f"   🎉 Job {job_id} complete!")
+    print(f"   📺 {WORKER_URL}/api/video/{job_id}")
+    return
 
 
-def _generate_srt(text: str, output_path: str, chunk_secs: int = 4):
-    """Generate an SRT subtitle file from narration text."""
+async def _process_job_error(job_id: str, e: Exception):
+    print(f"   ❌ Job failed: {e}")
+    try:
+        await api(f"/api/jobs/{job_id}/status", "PUT", json_data={
+            "status": "error", "error": str(e)[:500],
+        })
+    except Exception:
+        pass
+
+
+def _parse_vtt_for_steps(vtt_path: str, num_steps: int, total_duration: float) -> list[float]:
+    """Parse edge-tts VTT subtitle file. Distribute cue timings across steps.
+    Returns list of pause durations, one per step."""
+    import re
+    try:
+        with open(vtt_path) as f:
+            content = f.read()
+    except Exception:
+        return [total_duration / num_steps] * num_steps
+
+    # Extract cue timestamps: 00:00:01.234 --> 00:00:03.456
+    cues = re.findall(r'(\d+:\d{2}:\d{2}\.\d{3})\s*-->\s*(\d+:\d{2}:\d{2}\.\d{3})', content)
+    if not cues:
+        return [total_duration / num_steps] * num_steps
+
+    def _to_sec(ts: str) -> float:
+        h, m, s = ts.split(':')
+        return int(h) * 3600 + int(m) * 60 + float(s)
+
+    # Map cues to steps proportionally
+    total_cues = len(cues)
+    cues_per_step = max(1, total_cues // num_steps)
+    pauses = []
+
+    for step_i in range(num_steps):
+        start_idx = step_i * cues_per_step
+        end_idx = min(start_idx + cues_per_step, total_cues) - 1
+        if start_idx < total_cues and end_idx < total_cues:
+            seg_start = _to_sec(cues[start_idx][0])
+            seg_end = _to_sec(cues[end_idx][1])
+            pauses.append(seg_end - seg_start)
+        else:
+            pauses.append(total_duration / num_steps)
+
+    return pauses
+
+
+def _generate_srt(text: str, output_path: str, duration: float = 30, step_times: list[float] | None = None):
+    """Generate SRT subtitles synced to step timestamps when available."""
     words = text.split()
     if not words:
         return
 
-    # Split into chunks of ~10 words each
+    # Split narration into ~10-word chunks
     words_per_chunk = max(1, len(words) // max(1, (len(words) + 9) // 10))
     chunks = []
     for i in range(0, len(words), words_per_chunk):
@@ -540,18 +593,47 @@ def _generate_srt(text: str, output_path: str, chunk_secs: int = 4):
         if chunk:
             chunks.append(chunk)
 
-    def _fmt(sec: int) -> str:
-        h, m = divmod(sec, 3600)
+    def _fmt(sec: float) -> str:
+        ms = int((sec % 1) * 1000)
+        total = int(sec)
+        h, m = divmod(total, 3600)
         m, s = divmod(m, 60)
-        return f"{h:02d}:{m:02d}:{s:02d},000"
+        return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
-    with open(output_path, "w") as f:
-        for i, chunk in enumerate(chunks):
-            start = i * chunk_secs
-            end = start + chunk_secs
-            f.write(f"{i + 1}\n")
-            f.write(f"{_fmt(start)} --> {_fmt(end)}\n")
-            f.write(f"{chunk}\n\n")
+    # Map chunks to step timestamps if available
+    if step_times and len(step_times) > 0:
+        # Distribute chunks across step boundaries
+        times = list(step_times) + [duration]  # add video end
+        chunks_per_step = max(1, len(chunks) // len(step_times))
+        with open(output_path, "w") as f:
+            chunk_idx = 0
+            for step_i in range(len(step_times)):
+                t_start = times[step_i]
+                t_end = times[step_i + 1]
+                step_chunks = min(chunks_per_step, len(chunks) - chunk_idx)
+                if step_i == len(step_times) - 1:
+                    step_chunks = len(chunks) - chunk_idx  # last step gets remainder
+                for j in range(step_chunks):
+                    if chunk_idx >= len(chunks):
+                        break
+                    seg_dur = (t_end - t_start) / step_chunks
+                    start = t_start + j * seg_dur
+                    end = min(start + seg_dur, t_end)
+                    f.write(f"{chunk_idx + 1}\n")
+                    f.write(f"{_fmt(start)} --> {_fmt(end)}\n")
+                    f.write(f"{chunks[chunk_idx]}\n\n")
+                    chunk_idx += 1
+    else:
+        # Fallback: even spacing
+        total_chunks = len(chunks)
+        chunk_secs = duration / total_chunks if total_chunks > 0 else 4
+        with open(output_path, "w") as f:
+            for i, chunk in enumerate(chunks):
+                start = i * chunk_secs
+                end = min(start + chunk_secs, duration)
+                f.write(f"{i + 1}\n")
+                f.write(f"{_fmt(start)} --> {_fmt(end)}\n")
+                f.write(f"{chunk}\n\n")
 
 
 # ── Main loop ───────────────────────────────────────────
