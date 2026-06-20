@@ -69,7 +69,7 @@ app.post('/api/jobs', async (c) => {
 // GET /api/jobs/next — runner polls for work to do
 app.get('/api/jobs/next', async (c) => {
   const row = await c.env.DB.prepare(
-    `SELECT * FROM jobs WHERE status IN ('extracting', 'ready', 'narrating')
+    `SELECT * FROM jobs WHERE status = 'extracting'
      ORDER BY created_at ASC LIMIT 1`
   ).first();
   return c.json(row || null);
@@ -90,47 +90,64 @@ app.get('/api/jobs/:id', async (c) => {
 // ── PLANNING — runner sends elements, Worker calls LLM ──
 
 // PUT /api/jobs/:id/elements — runner uploads extracted page elements
+// Round 1: no history. Round 2+: includes history of executed steps and new page elements.
 app.put('/api/jobs/:id/elements', async (c) => {
   const id = c.req.param('id');
-  const body = await c.req.json<{ url: string; elements: any }>();
+  const body = await c.req.json<{ url: string; elements: any; history?: any[]; round?: number }>();
   const llm = c.get('llm');
   const model = c.env.LLM_MODEL;
+  const round = body.round || 1;
 
-  const prompt = `You are a browser automation planner. Given a URL, user goal, and REAL interactive elements on the page, generate browser actions.
+  const historyBlock = body.history?.length
+    ? `\n=== ALREADY EXECUTED STEPS ===\n${JSON.stringify(body.history, null, 2)}\n\nDo NOT repeat these steps. Continue from where the previous steps left off.`
+    : '';
 
-Return ONLY a JSON array. Each step: {"action": "navigate|click|type|select|wait|upload|scroll", "target": "element text/description", "value": "optional value to type or select"}
+  const prompt = `You are a browser automation planner. Stay on the current website domain. Given the current page's REAL elements, generate the next actions to achieve the user's goal.
 
-Maximum 10 steps. target MUST match actual element text from the page elements listed below.
+Round: ${round}.${historyBlock}
 
-=== PAGE ELEMENTS ===
+Return ONLY a JSON array. Each step: {"action": "click|type|select|wait|upload|scroll", "target": "exact element text from page", "value": "optional"}
+
+CRITICAL RULES:
+- target MUST be an element text actually listed in CURRENT PAGE ELEMENTS below (copy it exactly)
+- Do NOT use "navigate" — stay on the current site
+- Do NOT invent URLs or elements not in the list
+- If no relevant element exists, return []
+
+=== CURRENT PAGE ELEMENTS ===
 ${JSON.stringify(body.elements, null, 2)}
 
-Generate the execution plan as a JSON array.`;
+Generate continuation plan JSON array.`;
 
   try {
-    // Fetch the job to get the goal
-    const job = await c.env.DB.prepare('SELECT goal FROM jobs WHERE id = ?').bind(id).first();
+    const job = await c.env.DB.prepare('SELECT goal, plan FROM jobs WHERE id = ?').bind(id).first();
     const goal = job?.goal || body.url;
+
+    // Merge new plan with existing history
+    const prevPlan: any[] = job?.plan ? JSON.parse(job.plan as string) : [];
+
     const resp = await llm.chat.completions.create({
       model,
       messages: [
         { role: 'system', content: prompt },
-        { role: 'user', content: `URL: ${body.url}\nGoal: ${goal}\n\nGenerate the execution plan as a JSON array.` },
+        { role: 'user', content: `URL: ${body.url}\nGoal: ${goal}\nRound: ${round}\n\nGenerate continuation plan.` },
       ],
       temperature: 0.3,
       max_tokens: 2000,
     });
 
     const text = resp.choices[0].message.content || '';
-    // Parse JSON from response
     const jsonMatch = text.match(/\[[\s\S]*\]/);
-    const plan = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
+    const newPlan: any[] = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
+
+    // Merge: old plan + new plan (append new to old)
+    const mergedPlan = [...prevPlan, ...newPlan];
 
     await c.env.DB.prepare(
       `UPDATE jobs SET plan = ?, status = 'ready', updated_at = ? WHERE id = ?`
-    ).bind(JSON.stringify(plan), Date.now(), id).run();
+    ).bind(JSON.stringify(mergedPlan), Date.now(), id).run();
 
-    return c.json({ plan });
+    return c.json({ plan: mergedPlan, new_steps: newPlan, round });
   } catch (e: any) {
     await c.env.DB.prepare(
       `UPDATE jobs SET status = 'error', error = ?, updated_at = ? WHERE id = ?`

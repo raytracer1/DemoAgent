@@ -303,19 +303,39 @@ async def process_job(job: dict):
         page = await context.new_page()
 
         try:
-            # ── Step 1: Extract elements ──
+            # ── Step 1: Extract elements + get initial plan ──
+            all_results = []  # all step results across all rounds
+            last_url = ""
+
             if status == "extracting":
                 print(f"   📄 Navigating to {url}...")
                 await page.goto(url, wait_until="networkidle", timeout=15000)
                 await asyncio.sleep(2)
 
+            # ── Multi-round planning loop ──
+            MAX_ROUNDS = 3
+            for round_num in range(1, MAX_ROUNDS + 1):
+                current_url = page.url
+                print(f"\n   🔄 Round {round_num} — current page: {current_url}")
+
+                # Extract elements from current page
                 print(f"   🔍 Extracting page elements...")
                 elements = await extract_page_elements(page)
 
-                print(f"   📤 Sending elements to Worker for planning...")
+                # Send to Worker: elements + history of executed steps
+                history = [{
+                    "step": r["index"],
+                    "action": r["action"],
+                    "target": r["target"],
+                    "status": r["status"],
+                } for r in all_results]
+
+                print(f"   📤 Sending to Worker for planning (round {round_num}, {len(history)} steps done)...")
                 await api(f"/api/jobs/{job_id}/elements", "PUT", json_data={
-                    "url": url,
+                    "url": current_url,
                     "elements": elements,
+                    "history": history,
+                    "round": round_num,
                 })
 
                 # Wait for Worker to generate plan
@@ -323,43 +343,61 @@ async def process_job(job: dict):
                     await asyncio.sleep(2)
                     updated = await api(f"/api/jobs/{job_id}")
                     if updated.get("status") == "ready" and updated.get("plan"):
-                        job["plan"] = updated["plan"]
-                        job["status"] = "ready"
+                        plan = updated["plan"]
+                        if isinstance(plan, str):
+                            plan = json.loads(plan)
                         break
                     if updated.get("status") == "error":
-                        raise Exception(f"Plan generation failed: {updated.get('error')}")
+                        raise Exception(f"Plan failed: {updated.get('error')}")
+                else:
+                    raise Exception("Planning timed out")
 
-                if not job.get("plan"):
-                    raise Exception("Plan generation timed out")
+                if not plan or len(plan) <= len(history):
+                    print(f"   ✅ No more steps needed. Goal reached!")
+                    break
 
-                plan = job["plan"]
-                print(f"   📋 Plan: {len(plan)} steps generated")
+                # Only execute NEW steps (skip already-executed ones)
+                new_steps = plan[len(history):]
+                if not new_steps:
+                    print(f"   ✅ All steps executed. Goal reached!")
+                    break
 
-            else:
-                # Job already has plan
-                plan = json.loads(job.get("plan", "[]")) if isinstance(job.get("plan"), str) else (job.get("plan") or [])
+                print(f"   📋 {len(new_steps)} new steps to execute")
+                await api(f"/api/jobs/{job_id}/status", "PUT", json_data={"status": "running"})
 
-            if not plan:
-                raise Exception("No execution plan available")
+                # Execute new steps
+                page_changed = False
+                for step in new_steps:
+                    idx = len(all_results)
+                    step["index"] = idx
+                    print(f"      Step {idx+1}: {step.get('action')} → {step.get('target', '')[:60]}")
+                    pre_url = page.url
+                    result = await execute_step(page, step, idx)
+                    all_results.append(result)
 
-            # ── Step 2: Execute plan ──
-            await api(f"/api/jobs/{job_id}/status", "PUT", json_data={"status": "running"})
-            print(f"   ▶️  Executing {len(plan)} steps...")
+                    if result["status"] == "error":
+                        print(f"      ⚠️  {result.get('error', 'unknown')}")
 
-            # Navigate to start URL first (first step might be a click)
-            if url not in page.url:
-                await page.goto(url, wait_until="networkidle", timeout=15000)
-                await asyncio.sleep(1)
+                    # Check if URL changed (navigation happened)
+                    post_url = page.url
+                    if post_url != pre_url and post_url != last_url:
+                        print(f"   🔀 Page changed: {pre_url[:50]} → {post_url[:50]}")
+                        last_url = post_url
+                        page_changed = True
+                        break  # break out of step loop, trigger re-planning
 
-            step_results = []
-            for i, step in enumerate(plan):
-                print(f"      Step {i+1}/{len(plan)}: {step.get('action')} → {step.get('target', '')[:50]}")
-                result = await execute_step(page, step, i)
-                step_results.append(result)
-                if result["status"] == "error":
-                    print(f"      ⚠️  {result['error']}")
+                    await asyncio.sleep(0.5)
 
-            print(f"   ✅ Plan executed: {sum(1 for r in step_results if r['status']=='ok')}/{len(plan)} steps OK")
+                # If all steps done without page change AND plan fully executed → done
+                if not page_changed and len(all_results) >= len(plan):
+                    break
+
+                # If page changed, we need another round — but re-check if plan still has more
+                if page_changed:
+                    continue
+
+            print(f"\n   ✅ All rounds complete: {len(all_results)} steps executed")
+            print(f"   Results: {sum(1 for r in all_results if r['status']=='ok')}/{len(all_results)} OK")
 
             # ── Step 3: Generate narration ──
             await api(f"/api/jobs/{job_id}/status", "PUT", json_data={"status": "narrating"})
