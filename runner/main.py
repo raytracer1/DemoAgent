@@ -37,9 +37,11 @@ TMP_ROOT.mkdir(parents=True, exist_ok=True)
 async def _launch_context(p, record_dir: str = "", cookies=None):
     """Launch browser context. Uses persistent profile if available."""
     if USE_PERSISTENT:
-        kwargs = {"user_data_dir": PROFILE_DIR, "viewport": VIEWPORT, "headless": True,
-                   "args": ["--disable-blink-features=AutomationControlled", "--no-sandbox"],
-                   "ignore_default_args": ["--enable-automation"]}
+        # Use non-headless with xvfb to bypass Google automation detection
+        use_headful = os.path.exists("/usr/bin/xvfb-run") or "DISPLAY" in os.environ
+        kwargs = {"user_data_dir": PROFILE_DIR, "viewport": VIEWPORT,
+                   "headless": not use_headful,
+                   "args": ["--no-sandbox", "--disable-gpu"]}
         if record_dir:
             kwargs["record_video_dir"] = record_dir
             kwargs["record_video_size"] = VIEWPORT
@@ -133,6 +135,8 @@ async def pre_login_accounts():
 
 async def handle_login_sessions():
     """Poll for sessions that need manual login (X server required)."""
+    if USE_PERSISTENT:
+        return  # persistent profile already has cookies, no login needed
     if "DISPLAY" not in os.environ and "WAYLAND_DISPLAY" not in os.environ:
         return  # no display server, skip login sessions entirely
     while True:
@@ -391,77 +395,52 @@ async def process_job(job: dict):
             await page.goto(url, wait_until="domcontentloaded", timeout=15000)
             await asyncio.sleep(2)
 
-            # Pre-login: handle Google OAuth (supports redirect + popup)
+            # Pre-login: auto-complete Google OAuth with stored credentials
+            GOOGLE_EMAIL = os.getenv("GOOGLE_EMAIL", "")
+            GOOGLE_PASSWORD = os.getenv("GOOGLE_PASSWORD", "")
             for btn_text in ["Sign in", "Sign In", "Log in", "Login"]:
                 try:
                     b = page.get_by_text(btn_text, exact=True).first
                     if await b.count() > 0 and await b.is_visible():
                         print(f"   🔑 Detected '{btn_text}' — auto-completing OAuth...")
-
-                        # Watch for popup
-                        popup_promise = None
-                        try:
-                            popup_promise = page.wait_for_event("popup", timeout=5000)
-                        except: pass
-
                         await b.click()
 
-                        oauth_page = None
-                        if popup_promise:
-                            try:
-                                oauth_page = await popup_promise
-                                print(f"   📄 OAuth popup opened")
-                            except: pass
+                        # Handle Google OAuth flow for up to 45s
+                        for _ in range(20):
+                            await asyncio.sleep(2)
+                            current_url = page.url
 
-                        # If no popup in 5s, check if main page navigated
-                        if not oauth_page:
-                            await asyncio.sleep(3)
-                            for _ in range(5):
-                                if "accounts.google.com" in page.url:
-                                    oauth_page = page
-                                    break
-                                await asyncio.sleep(1)
+                            if "accounts.google.com" not in current_url:
+                                break  # back on site — done
 
-                        # Complete OAuth flow
-                        if oauth_page:
-                            # Step through Google's multi-page OAuth
-                            for _ in range(15):
-                                await asyncio.sleep(2)
-                                clicked = False
-                                # Try to click account/profile first
-                                for sel in ["div[role='link']", "div[data-email]", "li[role='menuitem']"]:
-                                    try:
-                                        bb = oauth_page.locator(sel).first
-                                        if await bb.count() > 0 and await bb.is_visible():
-                                            await bb.click()
-                                            clicked = True
-                                            break
-                                    except: pass
-                                # Then try buttons
-                                if not clicked:
-                                    for b2 in ["Continue", "Allow", "Next", "Sign in", "Confirm"]:
-                                        try:
-                                            bb = oauth_page.locator(f"button:has-text('{b2}')").first
-                                            if await bb.count() > 0 and await bb.is_visible():
-                                                await bb.click()
-                                                clicked = True
-                                                break
-                                        except: pass
-                                # Check if we're done
-                                from urllib.parse import urlparse as _up2
-                                if "accounts.google.com" not in oauth_page.url:
-                                    break
-                                if not clicked:
-                                    break
-                            # Close popup if it was a popup
-                            if oauth_page != page:
-                                try: await oauth_page.close()
+                            # Auto-fill email
+                            if GOOGLE_EMAIL and ("signin/v2/identifier" in current_url or "identifier" in current_url):
+                                try:
+                                    inp = page.locator("input[type='email']")
+                                    if await inp.count() > 0 and await inp.is_visible():
+                                        await inp.fill(GOOGLE_EMAIL)
+                                        await page.locator("button:has-text('Next')").first.click()
+                                        continue
                                 except: pass
 
-                        # Wait for main page to reload
-                        await asyncio.sleep(2)
-                        try: await page.wait_for_load_state("networkidle", timeout=10000)
-                        except: pass
+                            # Auto-fill password
+                            if GOOGLE_PASSWORD and ("password" in current_url or "challenge" in current_url):
+                                try:
+                                    inp = page.locator("input[type='password']")
+                                    if await inp.count() > 0 and await inp.is_visible():
+                                        await inp.fill(GOOGLE_PASSWORD)
+                                        await page.locator("button:has-text('Next')").first.click()
+                                        continue
+                                except: pass
+
+                            # Click consent/allow buttons
+                            for b2 in ["Allow", "Continue", "Next", "Confirm"]:
+                                try:
+                                    bb = page.locator(f"button:has-text('{b2}')").first
+                                    if await bb.count() > 0 and await bb.is_visible():
+                                        await bb.click(); break
+                                except: pass
+
                         print(f"   ✅ OAuth complete")
                         break
                 except: pass
