@@ -177,21 +177,18 @@ export default function Home() {
             <button className="px-3 py-2 text-sm rounded-lg bg-purple-600 text-white hover:bg-purple-500" onClick={sendKeys}>Send</button>
           </div>
         )}
-      </div>
-
-      {/* Status & Results */}
-      <div className="bg-[#1a1a1a] border border-[#2a2a2a] rounded-xl p-6 mb-5">
+        {/* Status & Results */}
         {status && (
-          <div className="flex items-center gap-2 px-3.5 py-2.5 bg-[#111] border border-[#333] rounded-lg text-sm">
+          <div className="flex items-center gap-2 px-3.5 py-2.5 bg-[#111] border border-[#333] rounded-lg text-sm mt-3">
             <span className={`w-2 h-2 rounded-full shrink-0 ${dotColors[statusType]}`} />
             <span>{status}</span>
           </div>
         )}
-        {error && <div className="mt-3.5 p-3.5 bg-red-950/30 border border-red-900/50 rounded-lg text-sm text-red-400">❌ {error}</div>}
+        {error && <div className="mt-3 p-3.5 bg-red-950/30 border border-red-900/50 rounded-lg text-sm text-red-400">❌ {error}</div>}
+        {narration && <div className="mt-3 p-3.5 bg-[#111] border border-[#2a2a2a] rounded-lg text-sm leading-relaxed text-[#bbb] whitespace-pre-wrap">📝 {narration}</div>}
         {jobId && statusType === 'done' && (
           <div className="mt-4"><video className="w-full rounded-lg border border-[#2a2a2a]" src={videoUrl(jobId)} controls /></div>
         )}
-        {narration && <div className="mt-3.5 p-3.5 bg-[#111] border border-[#2a2a2a] rounded-lg text-sm leading-relaxed text-[#bbb] whitespace-pre-wrap">📝 {narration}</div>}
       </div>
     </main>
   );
