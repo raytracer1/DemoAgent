@@ -1,7 +1,7 @@
 'use client';
 
-import { useState, useRef, useCallback, useEffect } from 'react';
-import { createJob, getJob, videoUrl } from '@/lib/api';
+import { useState, useRef, useCallback } from 'react';
+import { getJob, videoUrl } from '@/lib/api';
 
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8765';
 const WORKER = process.env.NEXT_PUBLIC_WORKER_URL || 'https://demo-agent-worker.zhengbijun123.workers.dev';
@@ -21,13 +21,12 @@ export default function Home() {
   const wsRef = useRef<WebSocket>();
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
-  // ── Remote Browser ──
   const connectBrowser = useCallback(() => {
     if (!url.trim()) return;
-    setStatus('连接远程浏览器...');
+    setBrowserLoading(true);
+    setStatus('Connecting...');
     setStatusType('active');
 
-    setBrowserLoading(true);
     const ws = new WebSocket(WS_URL);
     wsRef.current = ws;
     const img = new Image();
@@ -41,31 +40,20 @@ export default function Home() {
       setBrowserLoading(false);
     };
 
-    ws.onopen = () => {
-      ws.send(JSON.stringify({ action: 'connect', url: url.trim() }));
-    };
+    ws.onopen = () => ws.send(JSON.stringify({ action: 'connect', url: url.trim() }));
 
     ws.onmessage = (e) => {
       const msg = JSON.parse(e.data);
       if (msg.type === 'ready') {
-        setConnected(true);
-        setBrowserUrl(msg.url);
-        setStatus('');
-        setStatusType('idle');
-      } else if (msg.type === 'frame') {
-        if (msg.data) {
-          img.src = 'data:image/jpeg;base64,' + msg.data;
-        }
+        setConnected(true); setBrowserUrl(msg.url); setStatus(''); setStatusType('idle');
+      } else if (msg.type === 'frame' && msg.data) {
+        img.src = 'data:image/jpeg;base64,' + msg.data;
       } else if (msg.type === 'url_changed') {
         setBrowserUrl(msg.url);
       } else if (msg.type === 'demo_ready') {
-        setConnected(false);
-        ws.close();
-        // Trigger demo generation with cookies
-        triggerDemo(msg.cookies, msg.url);
+        setConnected(false); ws.close(); triggerDemo(msg.cookies, msg.url);
       } else if (msg.type === 'error') {
-        setError(msg.message);
-        setStatusType('error');
+        setError(msg.message); setStatusType('error');
       }
     };
 
@@ -73,159 +61,120 @@ export default function Home() {
   }, [url]);
 
   const sendClick = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (!wsRef.current || !connected) return;
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const rect = canvas.getBoundingClientRect();
-    const scaleX = 1280 / rect.width;
-    const scaleY = 720 / rect.height;
-    const x = Math.round((e.clientX - rect.left) * scaleX);
-    const y = Math.round((e.clientY - rect.top) * scaleY);
+    if (!wsRef.current || !connected || !canvasRef.current) return;
+    const rect = canvasRef.current.getBoundingClientRect();
+    const x = Math.round((e.clientX - rect.left) * (1280 / rect.width));
+    const y = Math.round((e.clientY - rect.top) * (720 / rect.height));
     wsRef.current.send(JSON.stringify({ action: 'click', x, y }));
   }, [connected]);
 
   const startDemo = useCallback(() => {
     if (!wsRef.current || !connected) return;
     wsRef.current.send(JSON.stringify({ action: 'start_demo' }));
-    setStatus('🤖 AI 接管中...');
-    setStatusType('active');
+    setStatus('🤖 AI taking over...'); setStatusType('active');
   }, [connected]);
 
   const triggerDemo = useCallback(async (cookiesStr: string, siteUrl: string) => {
-    setStatus('创建任务...');
+    setStatus('Creating job...');
     try {
-      // Save session with cookies
       const r1 = await fetch(`${WORKER}/api/sessions`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: siteUrl, cookies: cookiesStr }),
       });
       const { session_id } = await r1.json();
 
-      // Create job
       const r2 = await fetch(`${WORKER}/api/jobs`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: siteUrl, goal: goal.trim(), session_id }),
       });
       const { job_id } = await r2.json();
       setJobId(job_id);
 
-      // Poll for completion
       pollRef.current = setInterval(async () => {
         try {
           const job = await getJob(job_id);
-          if (job.status === 'extracting') { setStatus('📄 提取页面元素...'); setStatusType('active'); }
-          else if (job.status === 'planning') { setStatus('🧠 AI 规划步骤...'); setStatusType('active'); }
-          else if (job.status === 'ready') { setStatus('▶️ 执行操作...'); setStatusType('active'); }
-          else if (job.status === 'running') { setStatus('🎥 录制中...'); setStatusType('active'); }
-          else if (job.status === 'narrating') { setStatus('🎤 生成旁白...'); setStatusType('active'); }
+          if (job.status === 'extracting') { setStatus('📄 Extracting elements...'); setStatusType('active'); }
+          else if (job.status === 'planning') { setStatus('🧠 AI planning...'); setStatusType('active'); }
+          else if (job.status === 'ready') { setStatus('▶️  Executing...'); setStatusType('active'); }
+          else if (job.status === 'running') { setStatus('🎥 Recording...'); setStatusType('active'); }
+          else if (job.status === 'narrating') { setStatus('🎤 Generating narration...'); setStatusType('active'); }
           else if (job.status === 'done') {
             clearInterval(pollRef.current);
-            setStatus('✅ 完成');
-            setStatusType('done');
+            setStatus('✅ Complete'); setStatusType('done');
             if (job.narration) setNarration(job.narration);
           } else if (job.status === 'error') {
             clearInterval(pollRef.current);
-            setStatus('❌ 失败');
-            setStatusType('error');
+            setStatus('❌ Failed'); setStatusType('error');
             setError(job.error || 'Unknown');
           }
         } catch {}
       }, 2000);
-    } catch (e: any) {
-      setError(e.message);
-      setStatusType('error');
-    }
+    } catch (e: any) { setError(e.message); setStatusType('error'); }
   }, [goal]);
 
-  const dotClass = statusType === 'active' ? 'dot active' : statusType === 'done' ? 'dot done' : statusType === 'error' ? 'dot error' : 'dot';
+  const dotColors = { active: 'bg-purple-500 animate-pulse', done: 'bg-emerald-400', error: 'bg-red-500', idle: 'bg-neutral-600' };
 
   return (
-    <div style={styles.container}>
-      <h1 style={styles.title}>🎬 DemoAgent</h1>
-      <p style={styles.sub}>Connect to a website, log in, then AI generates your demo video</p>
+    <main className="max-w-[1320px] mx-auto px-5 py-10">
+      <h1 className="text-[28px] font-bold text-white mb-1">🎬 DemoAgent</h1>
+      <p className="text-[#888] text-[15px] mb-8">Connect to a website, log in, then AI generates your demo video</p>
 
-      <div style={styles.card}>
-        <label style={styles.label}>Target Website URL</label>
-        <input style={styles.input} type="url" value={url} onChange={e => setUrl(e.target.value)} placeholder="https://example.com" />
-        <div style={styles.btnRow}>
+      {/* Input Row */}
+      <div className="bg-[#1a1a1a] border border-[#2a2a2a] rounded-xl p-6 mb-5">
+        <div className="flex gap-3 items-center">
+          <input
+            className="flex-[2] px-3.5 py-2.5 text-[15px] bg-[#111] border border-[#333] rounded-lg text-[#e0e0e0] outline-none focus:border-purple-500"
+            type="url" value={url} onChange={e => setUrl(e.target.value)} placeholder="Target URL"
+          />
+          <input
+            className="flex-[2] px-3.5 py-2.5 text-[15px] bg-[#111] border border-[#333] rounded-lg text-[#e0e0e0] outline-none focus:border-purple-500"
+            type="text" value={goal} onChange={e => setGoal(e.target.value)} placeholder="Demo goal"
+          />
           {!connected ? (
-            <button style={styles.btnPrimary} onClick={connectBrowser}>🔗 Connect Account</button>
+            <button className="shrink-0 px-5 py-2.5 text-sm font-semibold rounded-lg bg-purple-600 text-white hover:bg-purple-500" onClick={connectBrowser}>🔗 Connect</button>
           ) : (
-            <button style={styles.btnSuccess} onClick={startDemo}>🚀 Start Demo</button>
+            <button className="shrink-0 px-5 py-2.5 text-sm font-semibold rounded-lg bg-emerald-500 text-black hover:bg-emerald-400" onClick={startDemo}>🚀 Start Demo</button>
           )}
-          {connected && <span style={{ ...styles.hint, color: '#00d2a0' }}>● Connected — {browserUrl}</span>}
         </div>
+        {connected && <p className="mt-2.5 text-[13px] text-emerald-400">● Connected — {browserUrl}</p>}
       </div>
 
-      {/* Remote Browser View */}
-      <div style={styles.card}>
-        <h2 style={styles.cardTitle}>{connected ? '🌐 Remote Browser (click to interact)' : '🌐 Browser Preview'}</h2>
+      {/* Remote Browser */}
+      <div className="bg-[#1a1a1a] border border-[#2a2a2a] rounded-xl p-6 mb-5">
+        <h2 className="text-base text-[#aaa] uppercase tracking-wide mb-3.5">
+          {connected ? '🌐 Remote Browser (click to interact)' : '🌐 Browser Preview'}
+        </h2>
         {browserLoading && (
-          <div style={styles.placeholder}>
+          <div className="py-16 text-center text-sm text-[#555] bg-[#111] rounded-lg border border-dashed border-[#2a2a2a]">
             ⏳ Launching remote browser... this may take a few seconds
+          </div>
+        )}
+        {!connected && !browserLoading && !status && (
+          <div className="py-16 text-center text-sm text-[#555] bg-[#111] rounded-lg border border-dashed border-[#2a2a2a]">
+            Click "Connect" to open a remote browser session
           </div>
         )}
         <canvas
           ref={canvasRef}
           onClick={sendClick}
-          style={{ ...styles.canvas, display: connected && !browserLoading ? 'block' : 'none' }}
+          className={`w-full rounded-lg border border-[#2a2a2a] cursor-crosshair ${connected && !browserLoading ? '' : 'hidden'}`}
         />
-        {!connected && !browserLoading && !status && (
-          <div style={styles.placeholder}>
-            Click "Connect Account" to open a remote browser session
-          </div>
-        )}
       </div>
 
-      {/* Demo Goal + Results */}
-      <div style={styles.card}>
-        <h2 style={styles.cardTitle}>Demo Goal</h2>
-        <input style={styles.input} type="text" value={goal} onChange={e => setGoal(e.target.value)} placeholder="What should the demo show?" />
+      {/* Status & Results */}
+      <div className="bg-[#1a1a1a] border border-[#2a2a2a] rounded-xl p-6 mb-5">
         {status && (
-          <div style={styles.statusBar}>
-            <span className={dotClass} />
+          <div className="flex items-center gap-2 px-3.5 py-2.5 bg-[#111] border border-[#333] rounded-lg text-sm">
+            <span className={`w-2 h-2 rounded-full shrink-0 ${dotColors[statusType]}`} />
             <span>{status}</span>
           </div>
         )}
-        {error && <div style={styles.errorBox}>❌ {error}</div>}
+        {error && <div className="mt-3.5 p-3.5 bg-red-950/30 border border-red-900/50 rounded-lg text-sm text-red-400">❌ {error}</div>}
         {jobId && statusType === 'done' && (
-          <div style={styles.videoWrap}>
-            <video style={styles.video} src={videoUrl(jobId)} controls />
-          </div>
+          <div className="mt-4"><video className="w-full rounded-lg border border-[#2a2a2a]" src={videoUrl(jobId)} controls /></div>
         )}
-        {narration && <div style={styles.narrationBox}>📝 {narration}</div>}
+        {narration && <div className="mt-3.5 p-3.5 bg-[#111] border border-[#2a2a2a] rounded-lg text-sm leading-relaxed text-[#bbb] whitespace-pre-wrap">📝 {narration}</div>}
       </div>
-
-      <style jsx>{`
-        .dot { width: 8px; height: 8px; border-radius: 50%; background: #555; flex-shrink: 0; display: inline-block; }
-        .dot.active { background: #6c5ce7; animation: pulse 1.2s infinite; }
-        .dot.done { background: #00d2a0; }
-        .dot.error { background: #ff4757; }
-        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
-      `}</style>
-    </div>
+    </main>
   );
 }
-
-const styles: Record<string, React.CSSProperties> = {
-  container: { maxWidth: 1320, margin: '0 auto', padding: '40px 20px' },
-  title: { fontSize: 28, marginBottom: 4, color: '#fff' },
-  sub: { color: '#888', fontSize: 15, marginBottom: 32 },
-  card: { background: '#1a1a1a', border: '1px solid #2a2a2a', borderRadius: 12, padding: 24, marginBottom: 20 },
-  cardTitle: { fontSize: 16, marginBottom: 14, color: '#aaa', textTransform: 'uppercase' as const, letterSpacing: 0.5 },
-  label: { display: 'block', fontSize: 13, color: '#999', marginBottom: 6, marginTop: 12 },
-  input: { width: '100%', padding: '10px 14px', fontSize: 15, background: '#111', border: '1px solid #333', borderRadius: 8, color: '#e0e0e0', outline: 'none' },
-  btnRow: { display: 'flex', gap: 10, marginTop: 18, alignItems: 'center' },
-  btnPrimary: { padding: '10px 22px', fontSize: 14, fontWeight: 600, border: 'none', borderRadius: 8, cursor: 'pointer', background: '#6c5ce7', color: '#fff' },
-  btnSuccess: { padding: '10px 22px', fontSize: 14, fontWeight: 600, border: 'none', borderRadius: 8, cursor: 'pointer', background: '#00d2a0', color: '#000' },
-  hint: { fontSize: 13, color: '#888' },
-  canvas: { width: '100%', borderRadius: 8, border: '1px solid #2a2a2a', cursor: 'crosshair' },
-  placeholder: { padding: 60, textAlign: 'center' as const, color: '#555', fontSize: 14, background: '#111', borderRadius: 8, border: '1px dashed #2a2a2a' },
-  statusBar: { display: 'flex', alignItems: 'center', gap: 8, padding: '10px 14px', background: '#111', border: '1px solid #333', borderRadius: 8, marginTop: 14, fontSize: 14 },
-  errorBox: { marginTop: 14, padding: 14, background: '#1f0f0f', border: '1px solid #3f1f1f', borderRadius: 8, fontSize: 14, color: '#ff6b7a' },
-  videoWrap: { marginTop: 16 },
-  video: { width: '100%', borderRadius: 8, border: '1px solid #2a2a2a' },
-  narrationBox: { marginTop: 14, padding: 14, background: '#111', border: '1px solid #2a2a2a', borderRadius: 8, fontSize: 14, lineHeight: 1.6, color: '#bbb', whiteSpace: 'pre-wrap' as const },
-};
