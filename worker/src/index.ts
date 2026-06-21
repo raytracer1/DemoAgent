@@ -36,12 +36,20 @@ app.post('/api/sessions', async (c) => {
   return c.json({ session_id: id, status: cookieVal ? 'ready' : 'pending_login', url });
 });
 
-// GET /api/sessions/next-pending — runner polls this
+// GET /api/sessions/next-pending — runner polls this (must be before :id)
 app.get('/api/sessions/next-pending', async (c) => {
   const row = await c.env.DB.prepare(
     'SELECT * FROM sessions WHERE cookies IS NULL ORDER BY created_at ASC LIMIT 1'
   ).first();
   return c.json(row || null);
+});
+
+// GET /api/sessions/:id — get session detail
+app.get('/api/sessions/:id', async (c) => {
+  const id = c.req.param('id');
+  const row = await c.env.DB.prepare('SELECT * FROM sessions WHERE id = ?').bind(id).first();
+  if (!row) return c.json({ error: 'not found' }, 404);
+  return c.json(row);
 });
 
 // PUT /api/sessions/:id/cookies — store login cookies

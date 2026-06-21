@@ -42,15 +42,17 @@ async def api(path: str, method="GET", data=None, json_data=None):
 
 # ── Login session handler ───────────────────────────────
 async def handle_login_sessions():
-    """Poll for sessions that need manual login."""
+    """Poll for sessions that need manual login (X server required)."""
     while True:
         try:
             session = await api("/api/sessions/next-pending")
             if session and session.get("id"):
+                if "DISPLAY" not in os.environ and "WAYLAND_DISPLAY" not in os.environ:
+                    print(f"\n⚠️  Login session {session['id']} pending but no display server — expecting manual cookie")
+                    break  # skip popup, rely on manual cookie flow
                 print(f"\n🔐 Login needed: {session['url']}")
                 await do_login(session)
             else:
-                # No pending sessions, break and move to job polling
                 break
         except Exception as e:
             print(f"Login poll error: {e}")
@@ -821,25 +823,35 @@ async def main():
     print(f"   Worker: {WORKER_URL}")
     print("=" * 50)
 
-    while True:
-        try:
-            # Check for login sessions first
-            await handle_login_sessions()
+    # Start WebSocket server for remote browser
+    WS_PORT = int(os.getenv("WS_PORT", "8765"))
+    import websockets
+    from browser_server import handle_ws
 
-            # Poll for jobs
-            job = await api("/api/jobs/next")
-            if job and job.get("id"):
-                await process_job(job)
-            else:
-                # No jobs, wait and poll
+    async def ws_handler(ws):
+        await handle_ws(ws, WORKER_URL)
+
+    ws_server = await websockets.serve(ws_handler, "0.0.0.0", WS_PORT)
+    print(f"   🌐 Browser WebSocket: ws://0.0.0.0:{WS_PORT}")
+
+    try:
+        while True:
+            try:
+                await handle_login_sessions()
+                job = await api("/api/jobs/next")
+                if job and job.get("id"):
+                    await process_job(job)
+                else:
+                    await asyncio.sleep(POLL_INTERVAL)
+            except KeyboardInterrupt:
+                break
+            except Exception as e:
+                print(f"Main loop error: {e}")
                 await asyncio.sleep(POLL_INTERVAL)
-
-        except KeyboardInterrupt:
-            print("\n👋 Shutting down...")
-            break
-        except Exception as e:
-            print(f"Main loop error: {e}")
-            await asyncio.sleep(POLL_INTERVAL)
+    finally:
+        ws_server.close()
+        await ws_server.wait_close()
+        print("\n👋 Shutting down...")
 
 
 if __name__ == "__main__":
