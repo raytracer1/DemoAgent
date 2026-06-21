@@ -15,6 +15,14 @@ from datetime import datetime
 import httpx
 from playwright.async_api import async_playwright
 
+# Load .env file if present
+_env_path = Path(__file__).parent / ".env"
+if _env_path.exists():
+    for _line in _env_path.read_text().strip().split("\n"):
+        if "=" in _line and not _line.startswith("#"):
+            _k, _v = _line.split("=", 1)
+            os.environ.setdefault(_k.strip(), _v.strip())
+
 # ── Config ─────────────────────────────────────────────
 WORKER_URL = os.getenv("WORKER_URL", "http://localhost:8787")
 POLL_INTERVAL = 3  # seconds between polls
@@ -206,7 +214,10 @@ async def extract_page_elements(page) -> dict:
         # Try to find associated label
         label_id = await el.get_attribute("id")
         if label_id:
-            label = await page.locator(f"label[for='{label_id}']").first.text_content()
+            try:
+                label = await page.locator(f"label[for='{label_id}']").first.text_content(timeout=2000)
+            except Exception:
+                label = ""
             if label:
                 label_text = label.strip()
         elements["inputs"].append({
@@ -379,30 +390,77 @@ async def process_job(job: dict):
             await page.goto(url, wait_until="domcontentloaded", timeout=15000)
             await asyncio.sleep(2)
 
-            # Pre-login: if page has "Sign in", complete OAuth now
+            # Pre-login: handle Google OAuth (supports redirect + popup)
             for btn_text in ["Sign in", "Sign In", "Log in", "Login"]:
                 try:
                     b = page.get_by_text(btn_text, exact=True).first
                     if await b.count() > 0 and await b.is_visible():
                         print(f"   🔑 Detected '{btn_text}' — auto-completing OAuth...")
+
+                        # Watch for popup
+                        popup_promise = None
+                        try:
+                            popup_promise = page.wait_for_event("popup", timeout=5000)
+                        except: pass
+
                         await b.click()
-                        # Wait for OAuth redirect back to site (max 20s)
-                        from urllib.parse import urlparse as _up
-                        target = _up(url).netloc
-                        for _ in range(20):
-                            await asyncio.sleep(1)
-                            if target in _up(page.url).netloc:
-                                # Back on site — check for Google consent
+
+                        oauth_page = None
+                        if popup_promise:
+                            try:
+                                oauth_page = await popup_promise
+                                print(f"   📄 OAuth popup opened")
+                            except: pass
+
+                        # If no popup in 5s, check if main page navigated
+                        if not oauth_page:
+                            await asyncio.sleep(3)
+                            for _ in range(5):
                                 if "accounts.google.com" in page.url:
-                                    for b2 in ["Allow", "Continue", "Next"]:
+                                    oauth_page = page
+                                    break
+                                await asyncio.sleep(1)
+
+                        # Complete OAuth flow
+                        if oauth_page:
+                            # Step through Google's multi-page OAuth
+                            for _ in range(15):
+                                await asyncio.sleep(2)
+                                clicked = False
+                                # Try to click account/profile first
+                                for sel in ["div[role='link']", "div[data-email]", "li[role='menuitem']"]:
+                                    try:
+                                        bb = oauth_page.locator(sel).first
+                                        if await bb.count() > 0 and await bb.is_visible():
+                                            await bb.click()
+                                            clicked = True
+                                            break
+                                    except: pass
+                                # Then try buttons
+                                if not clicked:
+                                    for b2 in ["Continue", "Allow", "Next", "Sign in", "Confirm"]:
                                         try:
-                                            bb = page.locator(f"button:has-text('{b2}')").first
+                                            bb = oauth_page.locator(f"button:has-text('{b2}')").first
                                             if await bb.count() > 0 and await bb.is_visible():
                                                 await bb.click()
-                                                await page.wait_for_timeout(3000)
+                                                clicked = True
+                                                break
                                         except: pass
-                                else:
+                                # Check if we're done
+                                from urllib.parse import urlparse as _up2
+                                if "accounts.google.com" not in oauth_page.url:
                                     break
+                                if not clicked:
+                                    break
+                            # Close popup if it was a popup
+                            if oauth_page != page:
+                                try: await oauth_page.close()
+                                except: pass
+
+                        # Wait for main page to reload
+                        await asyncio.sleep(2)
+                        try: await page.wait_for_load_state("networkidle", timeout=10000)
+                        except: pass
                         print(f"   ✅ OAuth complete")
                         break
                 except: pass
@@ -437,6 +495,11 @@ async def process_job(job: dict):
                 else:
                     raise Exception("Planning timed out")
 
+                # Filter noise steps from plan
+                NOISE = ["sign in", "login", "google", "auth", "allow", "continue with"]
+                plan = [s for s in plan if not any(k in (s.get("target","")+s.get("action","")).lower() for k in NOISE)]
+                plan = [s for s in plan if not (s.get("action")=="wait" and not s.get("target") and not s.get("value"))]
+
                 if not plan or len(plan) <= len(history):
                     print(f"   ✅ Plan complete!")
                     break
@@ -451,7 +514,12 @@ async def process_job(job: dict):
                     print(f"      {step['index']+1}: {step.get('action')} → {step.get('target', '')[:60]}")
                     pre_url = page.url
                     result = await execute_step(page, step, step["index"])
-                    all_steps.append(step)
+                    # Skip meaningless steps — don't count toward plan progress
+                    NOISE_KEYWORDS = ["sign in", "login", "google", "auth", "allow", "continue", "wait"]
+                    is_noise = any(k in (step.get("target", "") + step.get("action", "")).lower() for k in NOISE_KEYWORDS)
+                    is_empty_wait = step.get("action") == "wait" and not step.get("target") and not step.get("value")
+                    if not is_noise and not is_empty_wait:
+                        all_steps.append(step)
 
                     if page.url != pre_url and page.url != last_url:
                         # Check if we left the target site
