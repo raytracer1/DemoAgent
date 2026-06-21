@@ -434,6 +434,17 @@ async def process_job(job: dict):
     video_dir = str(temp_dir / "recording")
     os.makedirs(video_dir, exist_ok=True)
 
+    # ── Warm-up: preload page so recording starts on loaded page ──
+    async with async_playwright() as p:
+        warm_browser = await p.chromium.launch(headless=True)
+        warm_ctx = await warm_browser.new_context(viewport=VIEWPORT)
+        warm_page = await warm_ctx.new_page()
+        await warm_page.goto(url, wait_until="domcontentloaded", timeout=15000)
+        await _wait_for_content_stable(warm_page)
+        await warm_ctx.close()
+        await warm_browser.close()
+
+    # ── Phase 3: Record with preloaded cache ──
     async with async_playwright() as p:
         cookies = None
         if session_id:
@@ -454,9 +465,9 @@ async def process_job(job: dict):
         page = await context.new_page()
 
         try:
-            # Navigate to starting URL
+            # Navigate (fast — cached from warm-up)
             await page.goto(url, wait_until="domcontentloaded", timeout=15000)
-            await asyncio.sleep(1)
+            await _wait_for_content_stable(page)
 
             step_times: list[float] = []
             recording_start = time.time()
@@ -519,7 +530,6 @@ async def process_job(job: dict):
         err = stderr.decode() if stderr else "?"
         print(f"   ⚠️  ffmpeg error: {err[:200]}")
         final_path = recording_path  # fallback
-
     # ── Upload ──
     print(f"   📤 Uploading to R2...")
     with open(final_path, "rb") as f:
@@ -577,6 +587,31 @@ def _parse_vtt_for_steps(vtt_path: str, num_steps: int, total_duration: float) -
             pauses.append(total_duration / num_steps)
 
     return pauses
+
+
+async def _wait_for_content_stable(page, timeout: int = 30, interval: float = 0.8, stable_count: int = 20):
+    """Wait until interactive elements stop appearing — API content has rendered."""
+    start = time.time()
+    last_count = -1
+    stable = 0
+    while time.time() - start < timeout:
+        try:
+            # Count interactive elements (buttons, links, inputs)
+            btn = await page.locator("button:visible").count()
+            link = await page.locator("a:visible").count()
+            inp = await page.locator("input:visible, textarea:visible, select:visible").count()
+            total = btn + link + inp
+            if total == last_count and total > 0:
+                stable += 1
+                if stable >= stable_count:
+                    return  # DOM settled with real elements
+            else:
+                stable = 0
+                last_count = total
+        except Exception:
+            pass
+        await asyncio.sleep(interval)
+    # timeout — proceed anyway
 
 
 def _generate_srt(text: str, output_path: str, duration: float = 30, step_times: list[float] | None = None):
