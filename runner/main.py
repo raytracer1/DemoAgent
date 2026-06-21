@@ -29,7 +29,6 @@ TMP_ROOT.mkdir(parents=True, exist_ok=True)
 async def _launch_context(p, record_dir: str = "", cookies=None):
     """Launch browser context. Uses persistent profile if available."""
     if USE_PERSISTENT:
-        print(f"   🔄 Using persistent profile: {PROFILE_DIR}")
         kwargs = {"user_data_dir": PROFILE_DIR, "viewport": VIEWPORT, "headless": True,
                    "args": ["--disable-blink-features=AutomationControlled", "--no-sandbox"],
                    "ignore_default_args": ["--enable-automation"]}
@@ -291,15 +290,13 @@ async def execute_step(page, step: dict, index: int) -> dict:
             if el:
                 pre_click_url = page.url
                 await el.click(timeout=timeout)
-                # Domain guard: allow OAuth providers, block other external
+                # Domain guard: go back if we navigated to external site
                 from urllib.parse import urlparse as _up
-                OAUTH_DOMAINS = {"accounts.google.com", "login.microsoftonline.com"}
                 if _up(page.url).netloc and _up(pre_click_url).netloc:
                     if _up(pre_click_url).netloc not in _up(page.url).netloc and _up(page.url).netloc not in _up(pre_click_url).netloc:
-                        if _up(page.url).netloc not in OAUTH_DOMAINS:
-                            await page.go_back(timeout=timeout)
-                            result["status"] = "skipped"
-                            result["error"] = f"blocked external: {page.url[:60]}"
+                        await page.go_back(timeout=timeout)
+                        result["status"] = "skipped"
+                        result["error"] = f"blocked external: {page.url[:60]}"
             else:
                 result["status"] = "skipped"
                 result["error"] = f"not found: {target}"
@@ -382,6 +379,34 @@ async def process_job(job: dict):
             await page.goto(url, wait_until="domcontentloaded", timeout=15000)
             await asyncio.sleep(2)
 
+            # Pre-login: if page has "Sign in", complete OAuth now
+            for btn_text in ["Sign in", "Sign In", "Log in", "Login"]:
+                try:
+                    b = page.get_by_text(btn_text, exact=True).first
+                    if await b.count() > 0 and await b.is_visible():
+                        print(f"   🔑 Detected '{btn_text}' — auto-completing OAuth...")
+                        await b.click()
+                        # Wait for OAuth redirect back to site (max 20s)
+                        from urllib.parse import urlparse as _up
+                        target = _up(url).netloc
+                        for _ in range(20):
+                            await asyncio.sleep(1)
+                            if target in _up(page.url).netloc:
+                                # Back on site — check for Google consent
+                                if "accounts.google.com" in page.url:
+                                    for b2 in ["Allow", "Continue", "Next"]:
+                                        try:
+                                            bb = page.locator(f"button:has-text('{b2}')").first
+                                            if await bb.count() > 0 and await bb.is_visible():
+                                                await bb.click()
+                                                await page.wait_for_timeout(3000)
+                                        except: pass
+                                else:
+                                    break
+                        print(f"   ✅ OAuth complete")
+                        break
+                except: pass
+
             all_steps: list[dict] = []
             last_url = ""
             MAX_ROUNDS = 3
@@ -428,33 +453,16 @@ async def process_job(job: dict):
                     result = await execute_step(page, step, step["index"])
                     all_steps.append(step)
 
-                    # Auto-complete Google OAuth if redirected
-                    for _ in range(3):
-                        if "accounts.google.com" in page.url:
-                            await page.wait_for_timeout(2000)
-                            for btn_text in ["Allow", "Continue", "Next"]:
-                                try:
-                                    b = page.locator(f"button:has-text('{btn_text}')").first
-                                    if await b.count() > 0 and await b.is_visible():
-                                        print(f"      🔑 Auto-clicking Google OAuth: '{btn_text}'")
-                                        await b.click()
-                                        await page.wait_for_timeout(3000)
-                                        break
-                                except: pass
-
                     if page.url != pre_url and page.url != last_url:
                         # Check if we left the target site
                         from urllib.parse import urlparse
                         target_domain = urlparse(url).netloc
                         new_domain = urlparse(page.url).netloc
                         if target_domain and new_domain and target_domain not in new_domain and new_domain not in target_domain:
-                            if new_domain in ("accounts.google.com", "login.microsoftonline.com"):
-                                print(f"   🔑 OAuth redirect: {new_domain} — allowed")
-                            else:
-                                print(f"   🚫 External domain: {new_domain} — going back")
-                                all_steps.pop()
-                                await page.go_back()
-                                await asyncio.sleep(1)
+                            print(f"   🚫 External domain: {new_domain} — going back")
+                            all_steps.pop()  # remove the bad step
+                            await page.go_back()
+                            await asyncio.sleep(1)
                             continue  # skip this step, keep planning
                         print(f"   🔀 Page changed: {pre_url[:50]} → {page.url[:50]}")
                         last_url = page.url
@@ -593,14 +601,14 @@ async def process_job(job: dict):
             AUTH_KEYWORDS = ["sign in", "login", "google", "auth", "continue with", "allow"]
             demo_steps = [s for s in all_steps if not any(k in s.get("target", "").lower() for k in AUTH_KEYWORDS)]
             if len(demo_steps) < len(all_steps):
-                print(f"   🚫 Skipping {len(all_steps) - len(demo_steps)} auth step(s) in recording")
+                print(f"   🚫 Skipping {len(all_steps) - len(demo_steps)} auth step(s)")
 
             for i, step in enumerate(demo_steps):
                 # Wait for page stability before considering content valid
                 await _wait_for_content_stable(page)
                 seg_start = time.time() - recording_start
 
-                print(f"      Step {i+1}/{len(demo_steps)}: {step.get('action')} → {step.get('target', '')[:60]}")
+                print(f"      Step {i+1}/{len(all_steps)}: {step.get('action')} → {step.get('target', '')[:60]}")
                 await execute_step(page, step, i)
                 # Wait for new page to stabilize (if navigation happened)
                 await _wait_for_content_stable(page, timeout=10, interval=0.5, stable_count=6)
