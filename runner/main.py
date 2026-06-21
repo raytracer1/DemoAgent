@@ -372,11 +372,7 @@ async def process_job(job: dict):
                 except Exception:
                     pass
 
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(viewport=VIEWPORT)
-        if cookies:
-            await context.add_cookies(cookies)
-        page = await context.new_page()
+        context, page, browser = await _launch_context(p, cookies=cookies)
 
         try:
             print(f"   📄 Navigating to {url}...")
@@ -452,7 +448,7 @@ async def process_job(job: dict):
                     continue
 
             await context.close()
-            await browser.close()
+            if browser: await browser.close()
 
             if not all_steps:
                 raise Exception("No steps discovered")
@@ -463,7 +459,7 @@ async def process_job(job: dict):
 
         except Exception as e:
             await context.close()
-            await browser.close()
+            if browser: await browser.close()
             raise e
 
     # ── Phase 2: Narration + TTS (before recording) ──
@@ -554,15 +550,7 @@ async def process_job(job: dict):
                 try: cookies = json.loads(cookies_raw)
                 except Exception: pass
 
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(
-            viewport=VIEWPORT,
-            record_video_dir=video_dir,
-            record_video_size=VIEWPORT,
-        )
-        if cookies:
-            await context.add_cookies(cookies)
-        page = await context.new_page()
+        context, page, browser = await _launch_context(p, record_dir=video_dir, cookies=cookies)
 
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=15000)
@@ -602,7 +590,7 @@ async def process_job(job: dict):
                 print(f"      📐 Segment {i+1}: {seg_start:.1f}s → {seg_end:.1f}s")
 
             await context.close()
-            await browser.close()
+            if browser: await browser.close()
 
             # Find recording (wait briefly for file finalization)
             await asyncio.sleep(1)
@@ -615,7 +603,7 @@ async def process_job(job: dict):
 
         except Exception as e:
             await context.close()
-            await browser.close()
+            if browser: await browser.close()
             raise e
 
     # ── Phase 4: Trim segments + SRT + Assembly ──
@@ -903,6 +891,7 @@ async def main():
     print("=" * 50)
     print("🔄 DemoAgent Runner started")
     print(f"   Worker: {WORKER_URL}")
+    print(f"   Persistent profile: {'✅ ' + PROFILE_DIR if USE_PERSISTENT else '❌ not found'}")
     print("=" * 50)
 
     # Start WebSocket server for remote browser
