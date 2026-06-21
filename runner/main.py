@@ -333,8 +333,9 @@ async def execute_step(page, step: dict, index: int) -> dict:
         elif action == "upload":
             el = await find_element(page, target)
             if el:
-                # value should be a local file path
-                await el.set_input_files(value, timeout=timeout)
+                # Use sample.jpg from runner dir as default upload file
+                file_path = value if value and Path(value).exists() else str(Path(__file__).parent / "sample.jpg")
+                await el.set_input_files(file_path, timeout=timeout)
             else:
                 result["status"] = "skipped"
                 result["error"] = f"not found: {target}"
@@ -467,7 +468,7 @@ async def process_job(job: dict):
 
             all_steps: list[dict] = []
             last_url = ""
-            MAX_ROUNDS = 3
+            MAX_ROUNDS = 5
 
             for round_num in range(1, MAX_ROUNDS + 1):
                 current_url = page.url
@@ -495,10 +496,18 @@ async def process_job(job: dict):
                 else:
                     raise Exception("Planning timed out")
 
-                # Filter noise steps from plan
+                # Filter noise steps from plan: auth, wait, empty actions
                 NOISE = ["sign in", "login", "google", "auth", "allow", "continue with"]
                 plan = [s for s in plan if not any(k in (s.get("target","")+s.get("action","")).lower() for k in NOISE)]
-                plan = [s for s in plan if not (s.get("action")=="wait" and not s.get("target") and not s.get("value"))]
+                plan = [s for s in plan if s.get("action") != "wait" and s.get("action") != "scroll"]
+                plan = [s for s in plan if s.get("target", "").strip()]  # must have some target
+
+                # Stop if no new steps beyond history
+                plan_targets = set(s.get("target", "") + s.get("action", "") for s in plan)
+                history_targets = set(h.get("target", "") + h.get("action", "") for h in history)
+                if not plan_targets - history_targets:
+                    print(f"   ✅ No new steps — discovery complete")
+                    break
 
                 if not plan or len(plan) <= len(history):
                     print(f"   ✅ Plan complete!")
@@ -538,8 +547,7 @@ async def process_job(job: dict):
                         break
                     await asyncio.sleep(0.5)
 
-                if not page_changed and len(all_steps) >= len(plan):
-                    break
+                # Don't break if page didn't change — keep discovering on same page
                 if page_changed:
                     continue
 

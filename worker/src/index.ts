@@ -111,23 +111,28 @@ app.put('/api/jobs/:id/elements', async (c) => {
     ? `\n=== ALREADY EXECUTED STEPS ===\n${JSON.stringify(body.history, null, 2)}\n\nDo NOT repeat these steps. Continue from where the previous steps left off.`
     : '';
 
-  const prompt = `You are a browser automation planner. Stay on the current website domain. Given the current page's REAL elements, generate the next actions to achieve the user's goal.
+  const prompt = `You are a browser automation planner. Guide the user through a COMPLETE product demo that achieves their goal. The user is already logged in.
 
 Round: ${round}.${historyBlock}
 
 Return ONLY a JSON array. Each step: {"action": "click|type|select|wait|upload|scroll", "target": "exact element text from page", "value": "optional"}
 
 CRITICAL RULES:
+- Generate 3-6 steps per round to make progress toward the goal
+- Click into relevant content (cards, items, links) to explore deeper pages
+- For a "create/upload/customize" goal: interact with ALL visible form elements — click dropdowns to select options, type into inputs, click mood/template buttons, upload files
+- Use "select" to pick from dropdowns, "type" for text/number inputs, "click" for buttons/options, "upload" for file inputs
+- If a file upload step is needed, use value "sample.jpg"
+- After filling all form fields, ALWAYS end with clicking the final "Generate", "Create", "Submit", or "Save" button to complete the demo
 - target MUST be an element text actually listed in CURRENT PAGE ELEMENTS below (copy it exactly)
 - Do NOT use "navigate" — stay on the current site
-- If the page has a "Sign in" button, include it as a step to authenticate during discovery (it will be auto-skipped in the final video)
 - Do NOT invent URLs or elements not in the list
 - If no relevant element exists, return []
 
 === CURRENT PAGE ELEMENTS ===
 ${JSON.stringify(body.elements, null, 2)}
 
-Generate continuation plan JSON array.`;
+Generate 3-6 continuation steps as a JSON array.`;
 
   try {
     const job = await c.env.DB.prepare('SELECT goal, plan FROM jobs WHERE id = ?').bind(id).first();
