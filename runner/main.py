@@ -133,13 +133,13 @@ async def pre_login_accounts():
 
 async def handle_login_sessions():
     """Poll for sessions that need manual login (X server required)."""
+    if "DISPLAY" not in os.environ and "WAYLAND_DISPLAY" not in os.environ:
+        return  # no display server, skip login sessions entirely
     while True:
         try:
             session = await api("/api/sessions/next-pending")
             if session and session.get("id"):
-                if "DISPLAY" not in os.environ and "WAYLAND_DISPLAY" not in os.environ:
-                    print(f"\n⚠️  Login session {session['id']} pending but no display server — expecting manual cookie")
-                    break  # skip popup, rely on manual cookie flow
+                print(f"\n🔐 Login needed: {session['url']}")
                 print(f"\n🔐 Login needed: {session['url']}")
                 await do_login(session)
             else:
