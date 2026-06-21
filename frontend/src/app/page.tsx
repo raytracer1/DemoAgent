@@ -15,11 +15,11 @@ export default function Home() {
   const [narration, setNarration] = useState('');
   const [error, setError] = useState('');
   const [connected, setConnected] = useState(false);
+  const [browserLoading, setBrowserLoading] = useState(false);
   const [browserUrl, setBrowserUrl] = useState('');
   const pollRef = useRef<ReturnType<typeof setInterval>>();
   const wsRef = useRef<WebSocket>();
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const imgRef = useRef<HTMLImageElement | null>(null);
 
   // ── Remote Browser ──
   const connectBrowser = useCallback(() => {
@@ -27,18 +27,18 @@ export default function Home() {
     setStatus('连接远程浏览器...');
     setStatusType('active');
 
+    setBrowserLoading(true);
     const ws = new WebSocket(WS_URL);
     wsRef.current = ws;
-    imgRef.current = new Image();
+    const img = new Image();
 
-    imgRef.current.onload = () => {
+    img.onload = () => {
       const canvas = canvasRef.current;
       if (!canvas) return;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) return;
-      canvas.width = imgRef.current!.naturalWidth;
-      canvas.height = imgRef.current!.naturalHeight;
-      ctx.drawImage(imgRef.current!, 0, 0);
+      canvas.width = img.naturalWidth;
+      canvas.height = img.naturalHeight;
+      canvas.getContext('2d')?.drawImage(img, 0, 0);
+      setBrowserLoading(false);
     };
 
     ws.onopen = () => {
@@ -53,8 +53,8 @@ export default function Home() {
         setStatus('');
         setStatusType('idle');
       } else if (msg.type === 'frame') {
-        if (imgRef.current && msg.data) {
-          imgRef.current.src = 'data:image/jpeg;base64,' + msg.data;
+        if (msg.data) {
+          img.src = 'data:image/jpeg;base64,' + msg.data;
         }
       } else if (msg.type === 'url_changed') {
         setBrowserUrl(msg.url);
@@ -162,12 +162,17 @@ export default function Home() {
       {/* Remote Browser View */}
       <div style={styles.card}>
         <h2 style={styles.cardTitle}>{connected ? '🌐 Remote Browser (click to interact)' : '🌐 Browser Preview'}</h2>
+        {browserLoading && (
+          <div style={styles.placeholder}>
+            ⏳ Launching remote browser... this may take a few seconds
+          </div>
+        )}
         <canvas
           ref={canvasRef}
           onClick={sendClick}
-          style={{ ...styles.canvas, display: connected ? 'block' : 'none' }}
+          style={{ ...styles.canvas, display: connected && !browserLoading ? 'block' : 'none' }}
         />
-        {!connected && !status && (
+        {!connected && !browserLoading && !status && (
           <div style={styles.placeholder}>
             Click "Connect Account" to open a remote browser session
           </div>

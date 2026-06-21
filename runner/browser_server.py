@@ -36,7 +36,7 @@ async def handle_ws(ws, worker_url: str):
                 print(f"   🌐 Browser connect: {target_url}")
 
                 p = await async_playwright().start()
-                browser = await p.chromium.launch(headless=True)
+                browser = await p.chromium.launch(headless=False)
                 context = await browser.new_context(viewport=VIEWPORT)
                 page = await context.new_page()
                 await page.goto(target_url, wait_until="domcontentloaded", timeout=15000)
