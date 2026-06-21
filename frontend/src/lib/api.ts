@@ -1,10 +1,10 @@
 const WORKER = process.env.NEXT_PUBLIC_WORKER_URL || 'https://demo-agent-worker.zhengbijun123.workers.dev';
 
-export async function createSession(url: string) {
+export async function createSession(url: string, cookies?: string) {
   const resp = await fetch(`${WORKER}/api/sessions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ url }),
+    body: JSON.stringify({ url, cookies: cookies || undefined }),
   });
   return resp.json();
 }

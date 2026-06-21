@@ -25,14 +25,15 @@ app.use('*', async (c, next) => {
 
 // ── SESSIONS ───────────────────────────────────────────
 
-// POST /api/sessions — create login session
+// POST /api/sessions — create login session (optional manual cookie)
 app.post('/api/sessions', async (c) => {
-  const { url } = await c.req.json<{ url: string }>();
+  const { url, cookies: manualCookie } = await c.req.json<{ url: string; cookies?: string }>();
   const id = crypto.randomUUID();
+  const cookieVal = manualCookie || null;
   await c.env.DB.prepare(
-    'INSERT INTO sessions (id, url, cookies, created_at) VALUES (?, ?, NULL, ?)'
-  ).bind(id, url, Date.now()).run();
-  return c.json({ session_id: id, status: 'pending_login', url });
+    'INSERT INTO sessions (id, url, cookies, created_at) VALUES (?, ?, ?, ?)'
+  ).bind(id, url, cookieVal, Date.now()).run();
+  return c.json({ session_id: id, status: cookieVal ? 'ready' : 'pending_login', url });
 });
 
 // GET /api/sessions/next-pending — runner polls this

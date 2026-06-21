@@ -12,20 +12,39 @@ export default function Home() {
   const [jobId, setJobId] = useState<string | null>(null);
   const [narration, setNarration] = useState('');
   const [error, setError] = useState('');
-  const [loginMessage, setLoginMessage] = useState('Runner 会自动打开浏览器，登录后自动保存');
+  const [cookieInput, setCookieInput] = useState('');
+  const [loginMessage, setLoginMessage] = useState('');
   const pollRef = useRef<ReturnType<typeof setInterval>>();
 
   const doLogin = useCallback(async () => {
     if (!url.trim()) return;
-    setLoginMessage('⏳ 等待 Runner 打开浏览器...');
+    setLoginMessage('');
     try {
       const data = await createSession(url);
       setSessionId(data.session_id);
-      setLoginMessage('请在打开的浏览器中登录目标网站 (最多 120s)');
+      setLoginMessage('Runner 已收到，会在你的电脑上打开浏览器');
     } catch (e: any) {
       setLoginMessage(`❌ ${e.message}`);
     }
   }, [url]);
+
+  const doSetCookie = useCallback(async () => {
+    if (!url.trim()) return;
+    const raw = cookieInput.trim();
+    if (!raw) return;
+    // Accept: cookie JSON string, or raw cookie header, or single "name=value"
+    let cookies: string;
+    try { JSON.parse(raw); cookies = raw; } catch {
+      cookies = JSON.stringify(raw); // store as-is, runner will parse
+    }
+    try {
+      const data = await createSession(url, cookies);
+      setSessionId(data.session_id);
+      setLoginMessage('✅ Cookie 已保存，可以直接生成 Demo');
+    } catch (e: any) {
+      setLoginMessage(`❌ ${e.message}`);
+    }
+  }, [url, cookieInput]);
 
   const doGenerate = useCallback(async () => {
     if (!url.trim() || !goal.trim()) return;
@@ -83,8 +102,18 @@ export default function Home() {
         <label style={styles.label}>目标网站 URL</label>
         <input style={styles.input} type="url" value={url} onChange={e => setUrl(e.target.value)} placeholder="https://example.com" />
         <div style={styles.btnRow}>
-          <button style={styles.btnSecondary} onClick={doLogin}>🔐 登录网站</button>
+          <button style={styles.btnSecondary} onClick={doLogin}>🔐 Runner 弹窗登录</button>
           <span style={styles.hint}>{loginMessage}</span>
+        </div>
+        <label style={{ ...styles.label, marginTop: 16 }}>或手动粘贴 Cookie <span style={{color:'#666',fontSize:12}}>（DevTools → Application → Cookies → 复制值）</span></label>
+        <textarea
+          style={{ ...styles.input, minHeight: 60, fontFamily: 'monospace', fontSize: 12, resize: 'vertical' } as any}
+          value={cookieInput}
+          onChange={e => setCookieInput(e.target.value)}
+          placeholder='key1=value1; key2=value2'
+        />
+        <div style={styles.btnRow}>
+          <button style={styles.btnPrimary} onClick={doSetCookie}>📋 粘贴 Cookie</button>
         </div>
       </div>
 
