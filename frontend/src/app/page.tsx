@@ -17,6 +17,7 @@ export default function Home() {
   const [connected, setConnected] = useState(false);
   const [browserLoading, setBrowserLoading] = useState(false);
   const [browserUrl, setBrowserUrl] = useState('');
+  const [keyInput, setKeyInput] = useState('');
   const pollRef = useRef<ReturnType<typeof setInterval>>();
   const wsRef = useRef<WebSocket>();
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -59,6 +60,12 @@ export default function Home() {
 
     ws.onclose = () => setConnected(false);
   }, [url]);
+
+  const sendKeys = useCallback(() => {
+    if (!wsRef.current || !connected || !keyInput.trim()) return;
+    wsRef.current.send(JSON.stringify({ action: 'type', text: keyInput }));
+    setKeyInput('');
+  }, [connected, keyInput]);
 
   const sendClick = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     if (!wsRef.current || !connected || !canvasRef.current) return;
@@ -159,6 +166,17 @@ export default function Home() {
           onClick={sendClick}
           className={`w-full rounded-lg border border-[#2a2a2a] cursor-crosshair ${connected && !browserLoading ? '' : 'hidden'}`}
         />
+        {connected && (
+          <div className="flex gap-2 mt-3">
+            <input
+              className="flex-1 px-3 py-2 text-sm bg-[#111] border border-[#333] rounded-lg text-[#e0e0e0] outline-none focus:border-purple-500 font-mono"
+              type="text" value={keyInput} onChange={e => setKeyInput(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter') sendKeys(); }}
+              placeholder="Type here, press Enter to send to browser..."
+            />
+            <button className="px-3 py-2 text-sm rounded-lg bg-purple-600 text-white hover:bg-purple-500" onClick={sendKeys}>Send</button>
+          </div>
+        )}
       </div>
 
       {/* Status & Results */}

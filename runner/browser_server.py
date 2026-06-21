@@ -49,7 +49,7 @@ async def handle_ws(ws, worker_url: str):
             elif action == "click":
                 if page:
                     x, y = msg.get("x", 0), msg.get("y", 0)
-                    # Scale coordinates: frontend canvas 1280x720 → viewport
+                    print(f"      🖱️  Click at ({x}, {y})")
                     await page.mouse.click(x, y)
                     await asyncio.sleep(0.3)
 
