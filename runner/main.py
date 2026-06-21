@@ -387,64 +387,80 @@ async def process_job(job: dict):
     print(f"   🎤 Generating narration...")
     narration_resp = await api(f"/api/jobs/{job_id}/narration", "POST")
     narration = narration_resp.get("narration", "")
-    print(f"   📝 Narration: {narration[:80]}...")
+    narration_segments: list[dict] = narration_resp.get("segments", [])  # [{step, text}, ...]
+    print(f"   📝 Narration: {len(narration_segments)} step segments")
 
-    audio_path = str(temp_dir / "narration.mp3")
-    subs_path = str(temp_dir / "narration.vtt")
-    audio_duration = 30.0  # fallback
-    per_step_pauses: list[float] = []  # exact pause per step from subtitle timing
+    # ── Phase 2: Per-step TTS → exact per-step durations ──
+    audio_segments: list[str] = []  # paths to per-step mp3 files
+    per_step_pauses: list[float] = []
+    total_audio_duration = 0.0
 
-    if narration.strip():
-        try:
-            print(f"   🔊 Generating TTS with word timestamps...")
-            proc = await asyncio.create_subprocess_exec(
-                sys.executable, "-m", "edge_tts",
-                "--voice", "en-US-AriaNeural",
-                "--text", narration,
-                "--write-media", audio_path,
-                "--write-subtitles", subs_path,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            )
-            await proc.wait()
-            if proc.returncode == 0:
-                adur_proc = await asyncio.create_subprocess_exec(
-                    "ffprobe", "-v", "error", "-show_entries", "format=duration",
-                    "-of", "default=noprint_wrappers=1:nokey=1", audio_path,
+    if narration_segments:
+        for seg in narration_segments:
+            step_i = seg.get("step", 0)
+            text = seg.get("text", "")
+            if not text.strip():
+                audio_segments.append("")
+                per_step_pauses.append(3.0)  # default 3s
+                continue
+            seg_path = str(temp_dir / f"narration_step{step_i}.mp3")
+            try:
+                print(f"   🔊 TTS step {step_i}: {text[:50]}...")
+                proc = await asyncio.create_subprocess_exec(
+                    sys.executable, "-m", "edge_tts",
+                    "--voice", "en-US-AriaNeural",
+                    "--text", text,
+                    "--write-media", seg_path,
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                 )
-                adur_out, _ = await adur_proc.communicate()
-                audio_duration = float(adur_out.decode().strip())
-                print(f"   ⏱️  TTS: {audio_duration:.1f}s")
-
-                # Parse VTT subtitles to get per-step timing
-                per_step_pauses = _parse_vtt_for_steps(subs_path, len(all_steps), audio_duration)
-                print(f"   🕐 Per-step timing: {[f'{p:.1f}s' for p in per_step_pauses]}")
-            else:
-                print(f"   ⚠️  TTS failed"); audio_path = None
-        except Exception as e:
-            print(f"   ⚠️  TTS error: {e}"); audio_path = None
+                await proc.wait()
+                if proc.returncode == 0:
+                    dur_proc = await asyncio.create_subprocess_exec(
+                        "ffprobe", "-v", "error", "-show_entries", "format=duration",
+                        "-of", "default=noprint_wrappers=1:nokey=1", seg_path,
+                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                    )
+                    dur_out, _ = await dur_proc.communicate()
+                    step_dur = float(dur_out.decode().strip())
+                    per_step_pauses.append(step_dur)
+                    total_audio_duration += step_dur
+                    audio_segments.append(seg_path)
+                    print(f"      ⏱️  {step_dur:.1f}s")
+                else:
+                    per_step_pauses.append(3.0)
+                    audio_segments.append("")
+            except Exception as e:
+                print(f"      ⚠️  TTS error: {e}")
+                per_step_pauses.append(3.0)
+                audio_segments.append("")
     else:
-        audio_path = None
+        # Fallback: single TTS, split evenly
+        audio_path = str(temp_dir / "narration.mp3")
+        if narration.strip():
+            await _tts_single(narration, audio_path)
+            total_audio_duration = await _get_audio_duration(audio_path) or 30.0
+        per_step_pauses = [total_audio_duration / len(all_steps)] * len(all_steps) if all_steps else []
 
-    # ── Phase 3: Execute with recording (paced by exact audio timing) ──
-    if not per_step_pauses:
-        per_step_pauses = [audio_duration / len(all_steps)] * len(all_steps) if all_steps else []
+    # Concatenate per-step audio files into one final track
+    audio_path = str(temp_dir / "narration.mp3")
+    if len(audio_segments) > 1 and all(audio_segments):
+        await _concat_audio(audio_segments, audio_path)
+    elif len(audio_segments) == 1 and audio_segments[0]:
+        import shutil as _sh
+        _sh.copy(audio_segments[0], audio_path)
+
+    print(f"   🕐 Per-step timing: {[f'{p:.1f}s' for p in per_step_pauses]}")
+    print(f"   ⏱️  Total audio: {total_audio_duration:.1f}s")
+
+    # ── Phase 3: Execute with recording (paced by per-step audio) ──
     print(f"   🎬 Recording with per-step audio timing...")
 
     video_dir = str(temp_dir / "recording")
     os.makedirs(video_dir, exist_ok=True)
 
-    # ── Warm-up: preload page so recording starts on loaded page ──
-    async with async_playwright() as p:
-        warm_browser = await p.chromium.launch(headless=True)
-        warm_ctx = await warm_browser.new_context(viewport=VIEWPORT)
-        warm_page = await warm_ctx.new_page()
-        await warm_page.goto(url, wait_until="domcontentloaded", timeout=15000)
-        await _wait_for_content_stable(warm_page)
-        await warm_ctx.close()
-        await warm_browser.close()
-
-    # ── Phase 3: Record with preloaded cache ──
+    # ── Phase 3: Record with per-step stability + segment tracking ──
+    segments: list[tuple[float, float]] = []
+    step_times: list[float] = []
     async with async_playwright() as p:
         cookies = None
         if session_id:
@@ -465,45 +481,111 @@ async def process_job(job: dict):
         page = await context.new_page()
 
         try:
-            # Navigate (fast — cached from warm-up)
             await page.goto(url, wait_until="domcontentloaded", timeout=15000)
-            await _wait_for_content_stable(page)
 
-            step_times: list[float] = []
+            segments: list[tuple[float, float]] = []  # (start, end) of valid content per step
             recording_start = time.time()
 
+            # Handle intro (step -1): no action, just wait on loaded page
+            intro_pause = per_step_pauses[0] if per_step_pauses and narration_segments and narration_segments[0].get("step") == -1 else None
+            if intro_pause is not None:
+                per_step_pauses.pop(0)  # remove intro, keep only step pauses
+                await _wait_for_content_stable(page)
+                seg_start = time.time() - recording_start
+                print(f"      🎤 Intro: holding for {intro_pause:.1f}s")
+                await asyncio.sleep(intro_pause * 0.9)
+                seg_end = time.time() - recording_start
+                segments.append((seg_start, seg_end))
+                print(f"      📐 Intro segment: {seg_start:.1f}s → {seg_end:.1f}s")
+
             for i, step in enumerate(all_steps):
-                step_times.append(time.time() - recording_start)
+                # Wait for page stability before considering content valid
+                await _wait_for_content_stable(page)
+                seg_start = time.time() - recording_start
+
                 print(f"      Step {i+1}/{len(all_steps)}: {step.get('action')} → {step.get('target', '')[:60]}")
                 await execute_step(page, step, i)
+                # Wait for new page to stabilize (if navigation happened)
+                await _wait_for_content_stable(page, timeout=10, interval=0.5, stable_count=6)
                 # Pause for this step's narration segment duration
                 pause = per_step_pauses[i] if i < len(per_step_pauses) else per_step_pauses[-1]
-                pause *= 0.9  # slight overlap for natural flow
+                pause *= 0.9
                 print(f"      ⏸  Holding for {pause:.1f}s (narration for this step)")
                 await asyncio.sleep(pause)
+
+                seg_end = time.time() - recording_start
+                segments.append((seg_start, seg_end))
+                print(f"      📐 Segment {i+1}: {seg_start:.1f}s → {seg_end:.1f}s")
 
             await context.close()
             await browser.close()
 
-            # Find recording
-            video_files = sorted(Path(video_dir).glob("*.webm"))
+            # Find recording (wait briefly for file finalization)
+            await asyncio.sleep(1)
+            video_files = sorted(Path(video_dir).glob("*.webm"), key=lambda p: p.stat().st_size)
             if not video_files:
                 raise Exception("No recording found")
+            # Pick the largest file (actual content, not about:blank)
             recording_path = str(video_files[-1])
-            print(f"   🎥 Recording: {recording_path}")
+            print(f"   🎥 Recording: {recording_path} ({len(video_files)} files)")
 
         except Exception as e:
             await context.close()
             await browser.close()
             raise e
 
-    # ── Phase 4: SRT + Assembly ──
+    # ── Phase 4: Trim segments + SRT + Assembly ──
+    # First: trim recording to only valid segments, concat them
+    trimmed_path = str(temp_dir / "trimmed.mp4")
+    if segments and len(segments) > 0:
+        print(f"   ✂️  Trimming {len(segments)} valid segments...")
+        # Extract each segment with -ss/-to, then concat (compatible with all ffmpeg)
+        seg_files = []
+        for i, (start, end) in enumerate(segments):
+            seg_file = str(temp_dir / f"seg_{i}.mp4")
+            seg_cmd = ["ffmpeg", "-y", "-ss", str(start), "-to", str(end),
+                       "-i", recording_path,
+                       "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                       "-an", seg_file]
+            sp = await asyncio.create_subprocess_exec(*seg_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            await sp.wait()
+            if sp.returncode == 0:
+                seg_files.append(seg_file)
+
+        if seg_files:
+            # Concat all segments
+            list_path = str(temp_dir / "concat.txt")
+            temp_dir.mkdir(parents=True, exist_ok=True)  # ensure directory exists
+            with open(list_path, "w") as f:
+                for sf in seg_files:
+                    f.write(f"file '{sf}'\n")
+            concat_cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                          "-i", list_path, "-c", "copy", trimmed_path]
+            cp = await asyncio.create_subprocess_exec(*concat_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            await cp.wait()
+            if cp.returncode == 0:
+                recording_path = trimmed_path
+                # Recalculate step_times for trimmed timeline
+                trimmed_step_times = []
+                offset = 0.0
+                for start, end in segments:
+                    trimmed_step_times.append(offset)
+                    offset += (end - start)
+                step_times = trimmed_step_times
+                print(f"   ✅ Segments trimmed ({offset:.1f}s total)")
+            else:
+                print(f"   ⚠️  Concat failed, using full recording")
+        else:
+            print(f"   ⚠️  Segment extraction failed, using full recording")
+    else:
+        print(f"   ⚠️  No segments tracked, using full recording")
+
     srt_path = None
     if narration.strip():
         try:
             srt_path = str(temp_dir / "subtitles.srt")
-            _generate_srt(narration, srt_path, duration=audio_duration, step_times=step_times)
-            print(f"   📝 Subtitles (synced to {audio_duration:.1f}s TTS)")
+            _generate_srt(narration, srt_path, duration=total_audio_duration, step_times=step_times)
+            print(f"   📝 Subtitles (synced to {total_audio_duration:.1f}s TTS)")
         except Exception as e:
             print(f"   ⚠️  SRT error: {e}")
 
@@ -512,13 +594,13 @@ async def process_job(job: dict):
     has_audio = audio_path and Path(audio_path).exists()
 
     if has_audio:
-        print(f"   🎬 Assembling video + audio + subtitles...")
+        print(f"   🎬 Assembling trimmed video + audio + subtitles...")
         cmd = ["ffmpeg", "-y", "-i", recording_path, "-i", audio_path]
         if has_subs:
             cmd += ["-vf", f"subtitles={srt_path}:force_style='FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=1.5'"]
         cmd += ["-c:v", "libx264", "-preset", "fast", "-crf", "23", "-c:a", "aac", "-b:a", "128k", final_path]
     else:
-        print(f"   🎬 Converting video + subtitles...")
+        print(f"   🎬 Converting trimmed video + subtitles...")
         cmd = ["ffmpeg", "-y", "-i", recording_path]
         if has_subs:
             cmd += ["-vf", f"subtitles={srt_path}:force_style='FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,Outline=1.5'"]
@@ -530,6 +612,7 @@ async def process_job(job: dict):
         err = stderr.decode() if stderr else "?"
         print(f"   ⚠️  ffmpeg error: {err[:200]}")
         final_path = recording_path  # fallback
+
     # ── Upload ──
     print(f"   📤 Uploading to R2...")
     with open(final_path, "rb") as f:
@@ -550,6 +633,66 @@ async def _process_job_error(job_id: str, e: Exception):
         })
     except Exception:
         pass
+
+
+async def _detect_blank_end(video_path: str) -> float:
+    """Use ffmpeg blackdetect to find where blank/white frames end. Returns trim start time."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-i", video_path,
+            "-vf", "blackdetect=d=0.3:pix_th=0.15",
+            "-an", "-f", "null", "-",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        import re
+        # ffmpeg outputs: black_start:0 black_end:2.5 black_duration:2.5
+        matches = re.findall(r'black_end:([\d.]+)', stderr.decode() if stderr else "")
+        if matches:
+            return max(0, float(matches[-1]) - 0.3)  # slight overlap to be safe
+    except Exception:
+        pass
+    return 0.0
+
+
+async def _tts_single(text: str, output_path: str):
+    """Generate TTS for a single text segment."""
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-m", "edge_tts",
+        "--voice", "en-US-AriaNeural",
+        "--text", text,
+        "--write-media", output_path,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    await proc.wait()
+
+
+async def _get_audio_duration(path: str) -> float | None:
+    """Get audio file duration via ffprobe."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", path,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        out, _ = await proc.communicate()
+        return float(out.decode().strip())
+    except Exception:
+        return None
+
+
+async def _concat_audio(input_paths: list[str], output_path: str):
+    """Concatenate multiple audio files with ffmpeg concat demuxer."""
+    list_path = output_path + ".list.txt"
+    with open(list_path, "w") as f:
+        for p in input_paths:
+            f.write(f"file '{p}'\n")
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path,
+        "-c", "copy", output_path,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    await proc.wait()
 
 
 def _parse_vtt_for_steps(vtt_path: str, num_steps: int, total_duration: float) -> list[float]:
@@ -589,29 +732,29 @@ def _parse_vtt_for_steps(vtt_path: str, num_steps: int, total_duration: float) -
     return pauses
 
 
-async def _wait_for_content_stable(page, timeout: int = 30, interval: float = 0.8, stable_count: int = 20):
-    """Wait until interactive elements stop appearing — API content has rendered."""
+async def _wait_for_content_stable(page, timeout: int = 20, interval: float = 1.0, stable_count: int = 10):
+    """Wait until page text content stops changing — API data has rendered and settled."""
+    import hashlib
     start = time.time()
-    last_count = -1
+    last_hash = ""
     stable = 0
     while time.time() - start < timeout:
         try:
-            # Count interactive elements (buttons, links, inputs)
+            body = (await page.text_content("body")) or ""
+            # Also count interactive elements as a sanity check
             btn = await page.locator("button:visible").count()
             link = await page.locator("a:visible").count()
-            inp = await page.locator("input:visible, textarea:visible, select:visible").count()
-            total = btn + link + inp
-            if total == last_count and total > 0:
+            h = hashlib.md5((body + str(btn) + str(link)).encode()).hexdigest()
+            if h == last_hash and btn + link > 0:
                 stable += 1
                 if stable >= stable_count:
-                    return  # DOM settled with real elements
+                    return
             else:
                 stable = 0
-                last_count = total
+                last_hash = h
         except Exception:
             pass
         await asyncio.sleep(interval)
-    # timeout — proceed anyway
 
 
 def _generate_srt(text: str, output_path: str, duration: float = 30, step_times: list[float] | None = None):

@@ -157,9 +157,9 @@ Generate continuation plan JSON array.`;
   }
 });
 
-// ── NARRATION — Worker generates via LLM ──────────────
+// ── NARRATION — Worker generates per-step narration via LLM ──
 
-// POST /api/jobs/:id/narration — generate narration script
+// POST /api/jobs/:id/narration — generate per-step narration segments
 app.post('/api/jobs/:id/narration', async (c) => {
   const id = c.req.param('id');
   const job = await c.env.DB.prepare('SELECT * FROM jobs WHERE id = ?').bind(id).first();
@@ -168,7 +168,7 @@ app.post('/api/jobs/:id/narration', async (c) => {
   const llm = c.get('llm');
   const plan = JSON.parse((job.plan as string) || '[]');
   const stepsDesc = plan.map((s: any, i: number) =>
-    `Step ${i + 1}: ${s.action} → "${s.target}" ${s.value ? `(${s.value})` : ''}`
+    `Step ${i}: ${s.action} → "${s.target}" ${s.value ? `(${s.value})` : ''}`
   ).join('\n');
 
   const resp = await llm.chat.completions.create({
@@ -176,28 +176,28 @@ app.post('/api/jobs/:id/narration', async (c) => {
     messages: [
       {
         role: 'system',
-        content: `You are a product marketing copywriter. Write a voiceover for a 30–45 second product demo video.
-- Exciting, professional marketing tone
-- About 75–100 words
-- Describe what the user achieves
-- Plain text, no formatting
-Output only the narration script.`,
+        content: `You are a product marketing copywriter. Write a demo voiceover. First, an INTRO (step: -1) — 2-3 sentences introducing the app and what it does. Then, for each demo step, one sentence (10-15 words). Exciting tone, total 75-100 words. Return ONLY a JSON array:
+[{"step": -1, "text": "intro: welcome to this app..."}, {"step": 0, "text": "action for step 0..."}, ...]`,
       },
       {
         role: 'user',
-        content: `Product goal: ${job.goal}\n\nDemo steps:\n${stepsDesc}\n\nWrite the voiceover script.`,
+        content: `Product goal: ${job.goal}\n\nDemo steps:\n${stepsDesc}\n\nWrite intro + per-step narration as JSON array.`,
       },
     ],
     temperature: 0.7,
-    max_tokens: 500,
+    max_tokens: 800,
   });
 
-  const narration = resp.choices[0].message.content?.trim() || '';
+  const content = resp.choices[0].message.content?.trim() || '';
+  const jsonMatch = content.match(/\[[\s\S]*\]/);
+  const segments: {step: number; text: string}[] = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
+  const fullText = segments.map(s => s.text).join(' ');
+
   await c.env.DB.prepare(
     `UPDATE jobs SET narration = ?, updated_at = ? WHERE id = ?`
-  ).bind(narration, Date.now(), id).run();
+  ).bind(fullText, Date.now(), id).run();
 
-  return c.json({ narration });
+  return c.json({ narration: fullText, segments });
 });
 
 // ── STATUS (runner updates) ───────────────────────────
