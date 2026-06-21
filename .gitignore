@@ -12,3 +12,4 @@ node_modules/
 *.mp3
 .wrangler/
 .next/
+browser_profile

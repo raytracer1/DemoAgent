@@ -19,10 +19,36 @@ from playwright.async_api import async_playwright
 WORKER_URL = os.getenv("WORKER_URL", "http://localhost:8787")
 POLL_INTERVAL = 3  # seconds between polls
 VIEWPORT = {"width": 1280, "height": 720}
+PROFILE_DIR = str(Path(__file__).parent / "browser_profile")
+USE_PERSISTENT = os.path.isdir(PROFILE_DIR)
 
 # Temp dir for video processing
 TMP_ROOT = Path(tempfile.gettempdir()) / "demo-agent"
 TMP_ROOT.mkdir(parents=True, exist_ok=True)
+
+async def _launch_context(p, record_dir: str = "", cookies=None):
+    """Launch browser context. Uses persistent profile if available."""
+    if USE_PERSISTENT:
+        kwargs = {"user_data_dir": PROFILE_DIR, "viewport": VIEWPORT, "headless": True,
+                   "args": ["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+                   "ignore_default_args": ["--enable-automation"]}
+        if record_dir:
+            kwargs["record_video_dir"] = record_dir
+            kwargs["record_video_size"] = VIEWPORT
+        context = await p.chromium.launch_persistent_context(**kwargs)
+        page = context.pages[0] if context.pages else await context.new_page()
+        return context, page, None  # no separate browser object with persistent
+    else:
+        browser = await p.chromium.launch(headless=True)
+        ctx_kwargs = {"viewport": VIEWPORT}
+        if record_dir:
+            ctx_kwargs["record_video_dir"] = record_dir
+            ctx_kwargs["record_video_size"] = VIEWPORT
+        context = await browser.new_context(**ctx_kwargs)
+        if cookies:
+            await context.add_cookies(cookies)
+        page = await context.new_page()
+        return context, page, browser
 
 # ── HTTP helpers ────────────────────────────────────────
 async def api(path: str, method="GET", data=None, json_data=None):
@@ -41,6 +67,62 @@ async def api(path: str, method="GET", data=None, json_data=None):
 
 
 # ── Login session handler ───────────────────────────────
+async def pre_login_accounts():
+    """Pre-login test accounts from accounts.json, save cookies to D1."""
+    account_file = Path(__file__).parent / "accounts.json"
+    if not account_file.exists():
+        print("   ℹ️  No accounts.json found, skipping pre-login")
+        return
+
+    try:
+        accounts = json.loads(account_file.read_text())
+    except Exception:
+        print("   ⚠️  Failed to parse accounts.json")
+        return
+
+    if not accounts:
+        return
+
+    print(f"   🔐 Pre-logging {len(accounts)} account(s)...")
+    for acc in accounts:
+        url = acc.get("url", "")
+        login_steps = acc.get("login_steps", [])
+        if not url or not login_steps:
+            continue
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context(viewport=VIEWPORT)
+            page = await context.new_page()
+
+            try:
+                print(f"      🌐 Logging into {url}...")
+                await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+                await asyncio.sleep(2)
+
+                for step in login_steps:
+                    action = step.get("action", "")
+                    target = step.get("target", "")
+                    value = step.get("value", "")
+                    print(f"         {action} → {target}")
+                    await execute_step(page, step, -1)
+                    await asyncio.sleep(1.5)
+
+                # Save cookies to D1
+                cookies = await context.cookies()
+                cookie_str = json.dumps(cookies)
+                resp = await api("/api/sessions", "POST", json_data={
+                    "url": url, "cookies": cookie_str,
+                })
+                sid = resp.get("session_id", "")
+                print(f"      ✅ Logged in: session {sid}")
+            except Exception as e:
+                print(f"      ❌ Login failed: {e}")
+            finally:
+                await context.close()
+                await browser.close()
+
+
 async def handle_login_sessions():
     """Poll for sessions that need manual login (X server required)."""
     while True:
