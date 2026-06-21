@@ -43,24 +43,52 @@ async def main():
         print("   ✅ After login, press Enter here to continue...")
         input()
 
-        # Step 2: Optionally authorize a site
+        # Step 2: Automatically authorize OAuth sites
         if site_url:
-            print(f"🌐 Opening {site_url} for OAuth authorization...")
+            print(f"\n🌐 Opening {site_url} for OAuth authorization...")
             await page.goto(site_url, wait_until="domcontentloaded")
-            print("   ⏳ Click 'Sign in with Google' and authorize the site")
-            print("   ✅ Press Enter when done...")
-            input()
+            await page.wait_for_timeout(2000)
 
-            # Save site cookies
-            cookies = await context.cookies()
-            async with httpx.AsyncClient(timeout=30) as cli:
-                r = await cli.post(f"{WORKER_URL}/api/profiles", json={
-                    "url": site_url, "cookies": json.dumps(cookies),
-                })
-                if r.status_code == 200:
-                    print(f"   ✅ Site cookies saved for: {site_url}")
-                else:
-                    print(f"   ⚠️  Failed to save cookies")
+            # Click "Sign in" button
+            for btn_text in ["Sign in", "Sign In", "Log in", "Login", "Continue with Google", "Sign in with Google"]:
+                try:
+                    btn = page.get_by_text(btn_text, exact=True).first
+                    if await btn.count() > 0 and await btn.is_visible():
+                        print(f"   🖱️  Clicking '{btn_text}'...")
+                        await btn.click()
+                        await page.wait_for_timeout(3000)
+                        break
+                except: pass
+
+            # Handle Google OAuth: choose account / consent
+            for _ in range(3):  # up to 3 steps in OAuth flow
+                current = page.url
+                if "accounts.google.com" not in current and site_url.split('/')[2] in current:
+                    break  # back on site — done
+
+                # Click "Continue" or "Allow" on Google consent
+                for btn_text in ["Continue", "Allow", "Next", "Sign in"]:
+                    try:
+                        btn = page.locator(f"button:has-text('{btn_text}')").first
+                        if await btn.count() > 0 and await btn.is_visible():
+                            print(f"   🖱️  Google OAuth — clicking '{btn_text}'...")
+                            await btn.click()
+                            await page.wait_for_timeout(3000)
+                            break
+                    except: pass
+
+                # If we clicked a Google account, click it
+                try:
+                    account = page.locator("[data-email], [data-identifier]").first
+                    if await account.count() > 0:
+                        await account.click()
+                        await page.wait_for_timeout(2000)
+                        continue
+                except: pass
+
+                await page.wait_for_timeout(2000)
+
+            print(f"   ✅ OAuth flow complete")
 
         print(f"\n🎉 Done! Profile saved at: {PROFILE_DIR}")
         print(f"   Runner will use this profile for all Google OAuth sites")
