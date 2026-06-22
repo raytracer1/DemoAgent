@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"><style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{width:340px;padding:16px;font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#111;color:#e0e0e0}
+h1{font-size:18px;margin-bottom:4px}
+.sub{font-size:12px;color:#888;margin-bottom:12px}
+input{width:100%;padding:8px 12px;font-size:13px;background:#1a1a1a;border:1px solid #333;border-radius:8px;color:#e0e0e0;margin-bottom:8px;outline:none}
+input:focus{border-color:#6c5ce7}
+button{width:100%;padding:10px;font-size:13px;font-weight:600;border:none;border-radius:8px;cursor:pointer}
+.btn-start{background:#6c5ce7;color:#fff}
+.btn-start:disabled{opacity:.5;cursor:not-allowed}
+.status{font-size:12px;color:#888;margin-top:8px;text-align:center}
+video{width:100%;margin-top:8px;border-radius:8px;border:1px solid #2a2a2a}
+</style></head>
+<body>
+<h1>🎬 DemoAgent</h1>
+<p class="sub">Create demo video from current tab</p>
+<input type="text" id="goalInput" placeholder="Demo goal" value="create a video in world cup 2026">
+<button class="btn-start" id="startBtn">🚀 Start Demo</button>
+<div class="status" id="status"></div>
+<video id="videoPlayer" controls style="display:none"></video>
+<script src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "DemoAgent",
+  "version": "1.0",
+  "description": "AI-powered product demo video generator",
+  "permissions": ["tabCapture", "activeTab", "scripting", "storage", "offscreen"],
+  "host_permissions": ["https://api.deepseek.com/*", "https://demo-agent-worker.zhengbijun123.workers.dev/*"],
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [{
+    "matches": ["<all_urls>"],
+    "js": ["content.js"],
+    "run_at": "document_idle"
+  }],
+  "icons": {
+    "128": "icons/icon.png"
+  }
+}
