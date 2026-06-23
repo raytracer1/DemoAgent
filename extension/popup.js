@@ -88,7 +88,7 @@ async function stopAndUpload(state) {
         });
         const videoUrl = `${workerUrl}/api/video/${id}`;
         if (state?.videoUrl || state?.status === 'Complete' || true) {
-          chrome.tabs.create({ url: videoUrl });
+          chrome.tabs.create({ url: "https://demo-agent-jade.vercel.app/?video=" + encodeURIComponent(videoUrl) });
         }
         recordingView.style.display = 'none';
         idleView.style.display = 'block';
