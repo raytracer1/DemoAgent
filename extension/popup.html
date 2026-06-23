@@ -7,19 +7,30 @@ h1{font-size:18px;margin-bottom:4px}
 .sub{font-size:12px;color:#888;margin-bottom:12px}
 input{width:100%;padding:8px 12px;font-size:13px;background:#1a1a1a;border:1px solid #333;border-radius:8px;color:#e0e0e0;margin-bottom:8px;outline:none}
 input:focus{border-color:#6c5ce7}
-button{width:100%;padding:10px;font-size:13px;font-weight:600;border:none;border-radius:8px;cursor:pointer}
+.btn{width:100%;padding:10px;font-size:13px;font-weight:600;border:none;border-radius:8px;cursor:pointer;margin-bottom:6px}
 .btn-start{background:#6c5ce7;color:#fff}
-.btn-start:disabled{opacity:.5;cursor:not-allowed}
-.status{font-size:12px;color:#888;margin-top:8px;text-align:center}
-video{width:100%;margin-top:8px;border-radius:8px;border:1px solid #2a2a2a}
+.btn-stop{background:#ff4757;color:#fff}
+.status{font-size:12px;color:#888;margin-top:4px;text-align:center}
+.recording-dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#ff4757;animation:pulse 1s infinite;vertical-align:middle;margin-right:4px}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
 </style></head>
 <body>
 <h1>🎬 DemoAgent</h1>
-<p class="sub">Create demo video from current tab</p>
-<input type="text" id="goalInput" placeholder="Demo goal" value="create a video in world cup 2026">
-<button class="btn-start" id="startBtn">🚀 Start Demo</button>
-<div class="status" id="status"></div>
-<video id="videoPlayer" controls style="display:none"></video>
+
+<!-- Idle state -->
+<div id="idleView">
+  <p class="sub">Create demo video from current tab</p>
+  <input type="text" id="goalInput" placeholder="Demo goal" value="create a video in world cup 2026">
+  <button class="btn btn-start" id="startBtn">🚀 Start Demo</button>
+</div>
+
+<!-- Recording state -->
+<div id="recordingView" style="display:none">
+  <p class="sub"><span class="recording-dot"></span>Recording demo...</p>
+  <div class="status" id="status">AI is automating the page</div>
+  <button class="btn btn-stop" id="stopBtn">⏹ Stop Recording</button>
+</div>
+
 <script src="popup.js"></script>
 </body>
 </html>

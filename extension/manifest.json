@@ -3,7 +3,7 @@
   "name": "DemoAgent",
   "version": "1.0",
   "description": "AI-powered product demo video generator",
-  "permissions": ["tabCapture", "activeTab", "scripting", "storage", "offscreen"],
+  "permissions": ["tabCapture", "activeTab", "scripting", "storage"],
   "host_permissions": ["https://api.deepseek.com/*", "https://demo-agent-worker.zhengbijun123.workers.dev/*"],
   "action": {
     "default_popup": "popup.html"
